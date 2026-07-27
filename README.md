@@ -116,11 +116,38 @@ Supports:
 
 Future plans:
 
-- [ ] Keyboard shortcuts
-- [ ] Streaming optimization
-- [ ] Connection stability improvements
-- [ ] File transfer
+## 🗺️ Roadmap
+
+Completed:
+
+- [x] Basic remote connection
+- [x] WebRTC peer-to-peer communication
+- [x] Real-time screen streaming
+- [x] High-quality video transmission
+- [x] Remote mouse control
+- [x] Mouse drag mode
+- [x] Scroll control
+- [x] Custom virtual keyboard
+- [x] Keyboard input
+- [x] Basic keyboard shortcuts (Copy, Paste, Cut, Save)
+
+Planned:
+
+- [ ] Clipboard synchronization
 - [ ] Audio streaming
+- [ ] Connection status indicator
+- [ ] Performance statistics (FPS, latency)
+- [ ] Automatic reconnection
+- [ ] Remember previously connected devices
+- [ ] Wake-on-LAN support
+- [ ] Video quality settings
+- [ ] Frame rate settings
+- [ ] Keyboard shortcuts support
+- [ ] Additional keyboard layouts
+- [ ] Improved tablet interface
+- [ ] File transfer
+- [ ] Multiple monitor support
+- [ ] Adaptive streaming optimization
 - [ ] Stable public release
 
 ---

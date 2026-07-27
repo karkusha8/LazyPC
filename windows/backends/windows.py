@@ -16,6 +16,39 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
+VK = {
+    "ctrl": 0x11,
+    "alt": 0x12,
+    "shift": 0x10,
+
+    "a": 0x41,
+    "b": 0x42,
+    "c": 0x43,
+    "d": 0x44,
+    "e": 0x45,
+    "f": 0x46,
+    "g": 0x47,
+    "h": 0x48,
+    "i": 0x49,
+    "j": 0x4A,
+    "k": 0x4B,
+    "l": 0x4C,
+    "m": 0x4D,
+    "n": 0x4E,
+    "o": 0x4F,
+    "p": 0x50,
+    "q": 0x51,
+    "r": 0x52,
+    "s": 0x53,
+    "t": 0x54,
+    "u": 0x55,
+    "v": 0x56,
+    "w": 0x57,
+    "x": 0x58,
+    "y": 0x59,
+    "z": 0x5A,
+}
+
 
 # ================================================================
 # WINDOWS KEYBOARD LAYOUTS
@@ -690,7 +723,40 @@ class WindowsBackend:
                 error_code
             )
 
+    def _key_down_vk(self, vk):
 
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+
+        inp.ki = KEYBDINPUT(
+            wVk=vk,
+            wScan=0,
+            dwFlags=0,
+            time=0,
+            dwExtraInfo=0
+        )
+
+        self._send_input(inp)
+
+    def _key_up_vk(self, vk):
+
+        inp = INPUT()
+        inp.type = INPUT_KEYBOARD
+
+        inp.ki = KEYBDINPUT(
+            wVk=vk,
+            wScan=0,
+            dwFlags=KEYEVENTF_KEYUP,
+            time=0,
+            dwExtraInfo=0
+        )
+
+        self._send_input(inp)
+
+    def _press_vk(self, vk):
+
+        self._key_down_vk(vk)
+        self._key_up_vk(vk)
     # ============================================================
     # UNICODE TEXT VIA SENDINPUT
     # ============================================================
@@ -986,96 +1052,33 @@ class WindowsBackend:
     # SHORTCUT
     # ============================================================
 
-
     def shortcut(
-
-        self,
-
-        modifier_id: int,
-
-        key_id: int
+            self,
+            modifier_id: int,
+            key_id: int
     ):
 
-
-        modifier = (
-
-            MODIFIER_NAMES.get(
-                modifier_id
-            )
-        )
-
+        modifier = MODIFIER_NAMES.get(modifier_id)
 
         if modifier is None:
-
-
-            print(
-
-                "[KEYBOARD] Unknown modifier:",
-
-                modifier_id
-            )
-
-
             return
 
+        key = KEY_ID_NAMES[key_id]
 
-        if (
+        mod_vk = VK.get(modifier)
+        key_vk = VK.get(key)
 
-            key_id < 0
-
-            or
-
-            key_id >= len(KEY_ID_NAMES)
-
-        ):
-
-
-            print(
-
-                "[KEYBOARD] Unknown shortcut KeyId:",
-
-                key_id
-            )
-
-
+        if mod_vk is None or key_vk is None:
+            print("[KEYBOARD] Unsupported shortcut")
             return
 
+        print(f"[KEYBOARD] SHORTCUT -> {modifier} + {key}")
 
-        key = (
+        self.user32.keybd_event(mod_vk, 0, 0, 0)
+        self.user32.keybd_event(key_vk, 0, 0, 0)
 
-            KEY_ID_NAMES[
-                key_id
-            ]
-        )
-
-
-        print(
-
-            f"[KEYBOARD] SHORTCUT -> "
-
-            f"{modifier} + {key}"
-        )
-
-
-        try:
-
-
-            pyautogui.keyDown(
-                modifier
-            )
-
-
-            pyautogui.press(
-                key
-            )
-
-
-        finally:
-
-
-            pyautogui.keyUp(
-                modifier
-            )
+        self.user32.keybd_event(key_vk, 0, KEYEVENTF_KEYUP, 0)
+        self.user32.keybd_event(mod_vk, 0, KEYEVENTF_KEYUP, 0)
 
 
     # ============================================================
