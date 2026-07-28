@@ -5,6 +5,8 @@ import dxcam
 
 from aiortc import VideoStreamTrack
 
+from config.settings import ScreenConfig
+
 
 class DesktopVideoTrack(VideoStreamTrack):
 
@@ -15,16 +17,16 @@ class DesktopVideoTrack(VideoStreamTrack):
 
         # Создаём DXCam.
         #
-        # output_color="RGB" означает, что DXCam будет возвращать
-        # numpy-массив формата RGB.
+        # OUTPUT_COLOR определяет, в каком формате DXCam
+        # будет возвращать numpy-массив.
         self.camera = dxcam.create(
-            output_color="RGB"
+            output_color=ScreenConfig.OUTPUT_COLOR
         )
 
         # Запускаем захват рабочего стола.
         self.camera.start(
-            target_fps=60,
-            video_mode=True
+            target_fps=ScreenConfig.FPS,
+            video_mode=ScreenConfig.VIDEO_MODE
         )
 
         print("[VIDEO] DXCam started")
@@ -56,7 +58,9 @@ class DesktopVideoTrack(VideoStreamTrack):
             image = self.camera.get_latest_frame()
 
             if image is None:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(
+                    ScreenConfig.FRAME_WAIT_DELAY
+                )
 
         # Создаём настоящий VideoFrame из кадра DXCam.
         frame = av.VideoFrame.from_ndarray(
