@@ -1,5 +1,6 @@
 import asyncio
 import struct
+import time
 
 from typing import Callable, Optional
 
@@ -123,6 +124,12 @@ class PeerConnection:
 
 
         self._cursor_sync_task = None
+
+        # ============================================================
+        # CONNECTION CALLBACKS
+        # ============================================================
+
+        self.on_disconnected = None
 
 
         self._register_events()
@@ -253,19 +260,17 @@ class PeerConnection:
         self
     ):
 
-
-        @self.pc.on(
-            "connectionstatechange"
-        )
+        @self.pc.on("connectionstatechange")
         async def _():
 
+            state = self.pc.connectionState
 
-            print(
+            print("[WEBRTC] Connection state:", state)
 
-                "[WEBRTC] Connection state:",
+            if state in ("failed", "closed", "disconnected"):
 
-                self.pc.connectionState
-            )
+                if self.on_disconnected is not None:
+                    self.on_disconnected()
 
 
         @self.pc.on(
@@ -868,6 +873,11 @@ class PeerConnection:
 
                 "[ICE] Candidate received"
             )
+        elif message_type == "client_disconnected":
+
+            print("[SIGNALING] Client disconnected")
+
+            await self._on_peer_closed()
 
 
     # ================================================================
@@ -942,7 +952,7 @@ class PeerConnection:
 
             "[WEBRTC] Closing PeerConnection"
         )
-
+        total = time.perf_counter()
 
         # ========================================================
         # STOP CURSOR SYNC
@@ -960,8 +970,9 @@ class PeerConnection:
 
                 try:
 
-
+                    t = time.perf_counter()
                     await self._cursor_sync_task
+                    print(f"[TIME] cursor stop: {time.perf_counter() - t:.3f}s")
 
 
                 except asyncio.CancelledError:
@@ -980,8 +991,9 @@ class PeerConnection:
 
         try:
 
-
-            await self.video.stop()
+            t = time.perf_counter()
+            self.video.stop()
+            print(f"[TIME] video.stop(): {time.perf_counter() - t:.3f}s")
 
 
         except Exception as e:
@@ -1001,20 +1013,21 @@ class PeerConnection:
 
 
         if self.channel:
-
-
+            t = time.perf_counter()
             self.channel.close()
+            print(f"[TIME] channel.close(): {time.perf_counter() - t:.3f}s")
 
 
         # ========================================================
         # CLOSE PEER CONNECTION
         # ========================================================
 
+        print("[DEBUG] before pc.close")
+
+        t = time.perf_counter()
 
         await self.pc.close()
 
+        print("[DEBUG] after pc.close")
 
-        print(
-
-            "[WEBRTC] PeerConnection closed"
-        )
+        print(f"[TIME] pc.close(): {time.perf_counter() - t:.3f}s")

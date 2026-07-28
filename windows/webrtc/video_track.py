@@ -70,7 +70,7 @@ class DesktopVideoTrack(VideoStreamTrack):
 
         return frame
 
-    async def stop(self):
+    def stop(self):
 
         if self._stopped:
             return
