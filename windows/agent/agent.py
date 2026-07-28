@@ -143,9 +143,10 @@ class Agent:
 
         await self.signaling.connect()
 
-        await self.peer.create_offer()
+        print("[AGENT] Waiting for client...")
 
         print("[AGENT] Ready")
+
 
     # ================================================================
     # WAIT CLOSED
@@ -274,12 +275,10 @@ class Agent:
     # PEER CLOSED
     # ================================================================
 
-    def _on_peer_closed(
-            self
-    ):
+    async def _on_peer_closed(self):
 
-        print(
-            "[AGENT] Peer disconnected"
-        )
+        print("[AGENT] Peer disconnected")
 
-        self._closed_event.set()
+        await self.peer.stop_session()
+
+        print("[AGENT] Waiting for next client...")

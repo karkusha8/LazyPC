@@ -34,18 +34,14 @@ async def handle_connection(ws: WebSocket):
         await safe_close(previous)
 
     #
-    # Android подключился после Agent —
-    # сразу отправляем сохранённый Offer.
+    # Новый клиент подключился.
+    # Просим Agent создать новую WebRTC-сессию.
     #
     if role == PeerRole.CLIENT:
 
-        offer = await registry.get_offer()
+        print("📱 Client connected -> requesting new session")
 
-        if offer is not None:
-
-            print("📨 SEND STORED OFFER")
-
-            await safe_send_text(ws, offer)
+        await registry.notify_client_connected()
 
     try:
 
@@ -56,16 +52,8 @@ async def handle_connection(ws: WebSocket):
             print(f"📥 {role.value}: {msg[:80]}")
 
             #
-            # Запоминаем последний Offer.
+            # Просто пересылаем сообщение второй стороне.
             #
-            if (
-                role == PeerRole.AGENT
-                and '"type":"offer"' in msg.replace(" ", "")
-            ):
-                await registry.store_offer(msg)
-
-                print("💾 OFFER STORED")
-
             peer = await registry.get_peer(role)
 
             if peer is None:
@@ -80,14 +68,12 @@ async def handle_connection(ws: WebSocket):
                     f"{'client' if role == PeerRole.AGENT else 'agent'}"
                 )
 
-
     except WebSocketDisconnect:
 
         print(f"🔌 {role.value} disconnected")
 
         if role == PeerRole.CLIENT:
             await registry.notify_client_disconnected()
-
 
     finally:
 

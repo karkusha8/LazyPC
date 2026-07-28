@@ -45,22 +45,11 @@ class ConnectionRegistry:
             ):
                 self._session.client_ws = None
 
-                #
-                # Старый Offer больше недействителен.
-                #
-                self._session.last_offer = None
-
             elif (
                 role == PeerRole.AGENT
                 and self._session.agent_ws is ws
             ):
                 self._session.agent_ws = None
-
-                #
-                # Агент отключился —
-                # очищаем Offer.
-                #
-                self._session.last_offer = None
 
     async def get_peer(
         self,
@@ -79,29 +68,26 @@ class ConnectionRegistry:
                 return None
 
             try:
-
                 if peer.client_state.name != "CONNECTED":
                     return None
-
             except Exception:
                 return None
 
             return peer
 
-    async def store_offer(self, offer: str) -> None:
+    async def notify_client_connected(self) -> None:
 
-        async with self._session.lock:
-            self._session.last_offer = offer
+        agent = await self.get_peer(PeerRole.CLIENT)
 
-    async def get_offer(self) -> Optional[str]:
+        if agent is None:
+            return
 
-        async with self._session.lock:
-            return self._session.last_offer
-
-    async def clear_offer(self) -> None:
-
-        async with self._session.lock:
-            self._session.last_offer = None
+        try:
+            await agent.send_json({
+                "type": "create_session"
+            })
+        except Exception:
+            pass
 
     async def notify_client_disconnected(self) -> None:
 
@@ -114,8 +100,8 @@ class ConnectionRegistry:
             await agent.send_json({
                 "type": "client_disconnected"
             })
-
         except Exception:
             pass
-        
+
+
 registry = ConnectionRegistry()
