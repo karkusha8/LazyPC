@@ -4,6 +4,9 @@ import android.os.Bundle
 import android.util.Log
 import androidx.activity.compose.setContent
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import com.example.lazypc.input.CursorState
 import com.example.lazypc.input.MouseEmitter
 import com.example.lazypc.input.PointerInputRouter
@@ -13,23 +16,23 @@ import com.example.lazypc.keyboard.core.ActionResolver
 import com.example.lazypc.keyboard.core.KeyboardEngine
 import com.example.lazypc.keyboard.emit.KeyboardEmitter
 import com.example.lazypc.keyboard.mapping.LanguageEN
-import com.example.lazypc.network.WsClient
 import com.example.lazypc.ui.screens.RootScreen
 import com.example.lazypc.webrtc.WebRTCClient
+import com.example.lazypc.network.WsClient
 import org.json.JSONObject
 import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.SurfaceViewRenderer
+import org.webrtc.VideoFrame
+import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
-
 class MainActivity : AppCompatActivity() {
 
     companion object {
-
         private const val TAG_APP = "APP"
         private const val TAG_WS = "WS"
         private const val TAG_INPUT = "INPUT"
@@ -38,281 +41,195 @@ class MainActivity : AppCompatActivity() {
             "ws://192.168.0.148:8000/ws"
     }
 
-
     private lateinit var ws: WsClient
-
     private lateinit var webrtc: WebRTCClient
 
     private lateinit var renderer: SurfaceViewRenderer
-
     private lateinit var eglBase: EglBase
 
     private var currentVideoTrack: VideoTrack? = null
 
+    // ================================================================
+    // REAL VIDEO SIZE
+    // ================================================================
+
+    private var detectedVideoWidth by mutableIntStateOf(0)
+    private var detectedVideoHeight by mutableIntStateOf(0)
+
+    private var lastVideoWidth = 0
+    private var lastVideoHeight = 0
+
+    private val videoSizeSink = object : VideoSink {
+
+        override fun onFrame(frame: VideoFrame) {
+
+            val width = frame.rotatedWidth
+            val height = frame.rotatedHeight
+
+            if (width <= 0 || height <= 0) {
+                return
+            }
+
+            if (
+                width == lastVideoWidth &&
+                height == lastVideoHeight
+            ) {
+                return
+            }
+
+            lastVideoWidth = width
+            lastVideoHeight = height
+
+            Log.d(
+                TAG_APP,
+                "🎬 VIDEO SIZE: ${width}x${height}"
+            )
+
+            runOnUiThread {
+                detectedVideoWidth = width
+                detectedVideoHeight = height
+            }
+        }
+    }
 
     private lateinit var mouseEmitter: MouseEmitter
-
     private lateinit var gestureEngine: ClientGestureEngine
-
     private lateinit var pointerInputRouter: PointerInputRouter
-
 
     private val cursorState =
         CursorState()
 
+    private var mouseAreaWidth = 0f
+    private var mouseAreaHeight = 0f
 
-    /*
-     * ================================================================
-     * TOUCH AREA
-     *
-     * Область, на которой пользователь управляет мышью.
-     * ================================================================
-     */
+    private var videoAreaWidth = 0f
+    private var videoAreaHeight = 0f
 
+    private lateinit var keyboardEngine: KeyboardEngine
+    private lateinit var keyboardEmitter: KeyboardEmitter
 
-    private var mouseAreaWidth =
-        0f
+    private var dragModeEnabled = false
 
-
-    private var mouseAreaHeight =
-        0f
-
-
-    /*
-     * ================================================================
-     * VIDEO AREA
-     *
-     * Область, внутри которой рисуется курсор Windows.
-     * ================================================================
-     */
-
-
-    private var videoAreaWidth =
-        0f
-
-
-    private var videoAreaHeight =
-        0f
-
-
-    private lateinit var keyboardEngine:
-            KeyboardEngine
-
-
-    private lateinit var keyboardEmitter:
-            KeyboardEmitter
-
-
-    private var dragModeEnabled =
-        false
-
-
-    override fun onCreate(
-        savedInstanceState: Bundle?
-    ) {
-
+    override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-
-        // ============================================================
-        // ANDROID IMMERSIVE MODE
-        // ============================================================
 
         WindowCompat.setDecorFitsSystemWindows(
             window,
             false
         )
 
-
         WindowInsetsControllerCompat(
             window,
             window.decorView
         ).apply {
-
             hide(
                 WindowInsetsCompat.Type.systemBars()
             )
 
-
             systemBarsBehavior =
-
                 WindowInsetsControllerCompat
                     .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
-
 
         Log.d(
             TAG_APP,
             "🚀 LAZYPC START"
         )
 
-
-        eglBase =
-            EglBase.create()
-
+        eglBase = EglBase.create()
 
         // ============================================================
         // WEBRTC
         // ============================================================
 
+        webrtc = WebRTCClient(
+            context = this,
+            eglContext = eglBase.eglBaseContext,
 
-        webrtc =
+            onFrame = { track ->
 
-            WebRTCClient(
+                runOnUiThread {
 
-                context = this,
-
-                eglContext =
-                    eglBase.eglBaseContext,
-
-
-                onFrame = { track ->
-
-                    runOnUiThread {
-
-                        if (
-                            currentVideoTrack === track
-                        ) {
-
-                            return@runOnUiThread
-                        }
-
-
-                        if (
-                            ::renderer.isInitialized
-                        ) {
-
-                            currentVideoTrack
-                                ?.removeSink(renderer)
-                        }
-
-
-                        currentVideoTrack =
-                            track
-
-
-                        if (
-                            !::renderer.isInitialized
-                        ) {
-
-                            return@runOnUiThread
-                        }
-
-
-                        track.addSink(renderer)
-                    }
-                },
-
-
-                onIce = { candidate ->
-
-                    if (
-                        !::ws.isInitialized
-                    ) {
-
-                        return@WebRTCClient
+                    if (currentVideoTrack === track) {
+                        return@runOnUiThread
                     }
 
-
-                    val json =
-
-                        JSONObject().apply {
-
-                            put(
-                                "type",
-                                "candidate"
-                            )
-
-                            put(
-                                "candidate",
-                                candidate.sdp
-                            )
-
-                            put(
-                                "sdpMid",
-                                candidate.sdpMid
-                            )
-
-                            put(
-                                "sdpMLineIndex",
-                                candidate.sdpMLineIndex
-                            )
-                        }
-
-
-                    ws.sendText(
-                        json.toString()
-                    )
-                },
-
-
-                onCursorPosition = {
-
-                        normalizedX,
-                        normalizedY ->
-
-
-                    runOnUiThread {
-
-                        /*
-                         * Windows присылает:
-                         *
-                         * X = 0.0 .. 1.0
-                         * Y = 0.0 .. 1.0
-                         *
-                         * Переводим координаты именно
-                         * в размеры VIDEO AREA.
-                         */
-
-
-                        cursorState
-                            .setNormalizedPosition(
-
-                                normalizedX =
-                                    normalizedX,
-
-                                normalizedY =
-                                    normalizedY,
-
-                                width =
-                                    videoAreaWidth,
-
-                                height =
-                                    videoAreaHeight
-                            )
+                    if (::renderer.isInitialized) {
+                        currentVideoTrack
+                            ?.removeSink(renderer)
                     }
+
+                    currentVideoTrack
+                        ?.removeSink(videoSizeSink)
+
+                    currentVideoTrack = track
+
+                    track.addSink(videoSizeSink)
+
+                    if (!::renderer.isInitialized) {
+                        return@runOnUiThread
+                    }
+
+                    track.addSink(renderer)
                 }
-            )
+            },
 
+            onIce = { candidate ->
+
+                if (!::ws.isInitialized) {
+                    return@WebRTCClient
+                }
+
+                val json = JSONObject().apply {
+                    put("type", "candidate")
+                    put("candidate", candidate.sdp)
+                    put("sdpMid", candidate.sdpMid)
+                    put(
+                        "sdpMLineIndex",
+                        candidate.sdpMLineIndex
+                    )
+                }
+
+                ws.sendText(
+                    json.toString()
+                )
+            },
+
+            onCursorPosition = {
+                    normalizedX,
+                    normalizedY ->
+
+                runOnUiThread {
+
+                    cursorState.setNormalizedPosition(
+                        normalizedX = normalizedX,
+                        normalizedY = normalizedY,
+                        width = videoAreaWidth,
+                        height = videoAreaHeight
+                    )
+                }
+            }
+        )
 
         webrtc.init()
-
         webrtc.createPeerConnection()
-
 
         // ============================================================
         // MOUSE
         // ============================================================
 
-
         mouseEmitter =
             MouseEmitter(webrtc)
 
-
         gestureEngine =
-
             ClientGestureEngine(
-
                 isDragModeEnabled = {
-
                     dragModeEnabled
                 },
-
 
                 emit = { event ->
 
                     when (event) {
-
 
                         is GestureEvent.Move -> {
 
@@ -321,53 +238,29 @@ class MainActivity : AppCompatActivity() {
                                 event.dy
                             )
 
-
-                            /*
-                             * Локальный курсор также двигается
-                             * в координатах VIDEO AREA.
-                             */
-
-
                             cursorState.move(
-
-                                dx =
-                                    event.dx,
-
-                                dy =
-                                    event.dy,
-
-                                width =
-                                    videoAreaWidth,
-
-                                height =
-                                    videoAreaHeight
+                                dx = event.dx,
+                                dy = event.dy,
+                                width = videoAreaWidth,
+                                height = videoAreaHeight
                             )
                         }
 
-
                         GestureEvent.Tap -> {
-
                             mouseEmitter.sendTap()
                         }
 
-
                         GestureEvent.DoubleTap -> {
-
                             mouseEmitter.sendDoubleTap()
                         }
 
-
                         GestureEvent.ContextMenu -> {
-
                             mouseEmitter.sendRightClick()
                         }
 
-
                         GestureEvent.DragStart -> {
-
                             mouseEmitter.sendDragStart()
                         }
-
 
                         is GestureEvent.DragMove -> {
 
@@ -376,32 +269,19 @@ class MainActivity : AppCompatActivity() {
                                 event.dy
                             )
 
-
                             cursorState.move(
-
-                                dx =
-                                    event.dx,
-
-                                dy =
-                                    event.dy,
-
-                                width =
-                                    videoAreaWidth,
-
-                                height =
-                                    videoAreaHeight
+                                dx = event.dx,
+                                dy = event.dy,
+                                width = videoAreaWidth,
+                                height = videoAreaHeight
                             )
                         }
 
-
                         GestureEvent.DragEnd -> {
-
                             mouseEmitter.sendDragEnd()
                         }
 
-
                         is GestureEvent.Scroll -> {
-
                             mouseEmitter.sendScroll(
                                 event.dy
                             )
@@ -410,126 +290,92 @@ class MainActivity : AppCompatActivity() {
                 }
             )
 
-
         pointerInputRouter =
-
             PointerInputRouter(
                 gestureEngine
             )
-
 
         Log.d(
             TAG_INPUT,
             "✅ Mouse initialized"
         )
 
-
         // ============================================================
         // KEYBOARD
         // ============================================================
 
-
         keyboardEngine =
-
             KeyboardEngine(
-
-                resolver =
-                    ActionResolver(),
-
-                language =
-                    LanguageEN()
+                resolver = ActionResolver(),
+                language = LanguageEN()
             )
 
-
         keyboardEmitter =
-
             KeyboardEmitter(
                 webrtc
             )
-
 
         // ============================================================
         // UI
         // ============================================================
 
-
         setContent {
 
-
             RootScreen(
-
                 eglContext =
                     eglBase.eglBaseContext,
 
+                videoWidth =
+                    detectedVideoWidth,
+
+                videoHeight =
+                    detectedVideoHeight,
 
                 onSurfaceCreated = { surface ->
 
-
                     if (::renderer.isInitialized) {
-
                         currentVideoTrack
                             ?.removeSink(renderer)
-
                     }
 
-
-                    renderer =
-                        surface
-
+                    renderer = surface
 
                     currentVideoTrack
                         ?.addSink(renderer)
+
+                    currentVideoTrack
+                        ?.addSink(videoSizeSink)
                 },
 
-
                 onTouch = { event ->
-
                     pointerInputRouter.onTouch(
                         event
                     )
                 },
 
-
                 cursorState =
                     cursorState,
-
-
-                /*
-                 * TOUCH AREA SIZE
-                 */
-
 
                 onMouseAreaSizeChanged = {
                         width,
                         height ->
 
-
                     mouseAreaWidth =
                         width
-
 
                     mouseAreaHeight =
                         height
                 },
 
-
-                /*
-                 * VIDEO AREA SIZE
-                 */
-
-
                 onVideoAreaSizeChanged = {
                         width,
                         height ->
 
-
                     videoAreaWidth =
                         width
 
-
                     videoAreaHeight =
                         height
-
 
                     cursorState.initialize(
                         width,
@@ -537,20 +383,16 @@ class MainActivity : AppCompatActivity() {
                     )
                 },
 
-
                 keyboardEngine =
                     keyboardEngine,
 
-
                 keyboardEmitter =
                     keyboardEmitter,
-
 
                 onDragModeChanged = { enabled ->
 
                     dragModeEnabled =
                         enabled
-
 
                     Log.d(
                         TAG_INPUT,
@@ -560,61 +402,48 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-
         // ============================================================
         // SIGNALING
         // ============================================================
-
 
         ws =
             WsClient(
                 SIGNALING_URL
             )
 
-
         ws.setOnTextMessage { text ->
 
-            if (
-                !text.startsWith("{")
-            ) {
-
+            if (!text.startsWith("{")) {
                 return@setOnTextMessage
             }
-
 
             try {
 
                 val json =
                     JSONObject(text)
 
-
                 when (
                     json.optString("type")
                 ) {
-
 
                     "offer" -> {
 
                         val sdp =
                             json.optString("sdp")
 
-
-                        if (
-                            sdp.isEmpty()
-                        ) {
-
+                        if (sdp.isEmpty()) {
                             return@setOnTextMessage
                         }
-
 
                         webrtc.setRemoteOffer(
                             sdp
                         ) { answer ->
 
-                            ws.sendAnswer(answer)
+                            ws.sendAnswer(
+                                answer
+                            )
                         }
                     }
-
 
                     "candidate" -> {
 
@@ -623,37 +452,28 @@ class MainActivity : AppCompatActivity() {
                                 "candidate"
                             )
 
-
                         if (
                             candidateSdp.isEmpty()
                         ) {
-
                             return@setOnTextMessage
                         }
 
-
                         val candidate =
-
                             IceCandidate(
-
                                 json.optString(
                                     "sdpMid"
                                 ),
-
                                 json.optInt(
                                     "sdpMLineIndex"
                                 ),
-
                                 candidateSdp
                             )
-
 
                         webrtc.addRemoteCandidate(
                             candidate
                         )
                     }
                 }
-
 
             } catch (
                 e: Exception
@@ -667,13 +487,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-
         ws.connect()
     }
+
     override fun onPause() {
-
         super.onPause()
-
 
         Log.d(
             TAG_APP,
@@ -681,48 +499,37 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-
-
     override fun onResume() {
-
         super.onResume()
-
 
         Log.d(
             TAG_APP,
             "▶ APP RESUMED"
-
-
         )
 
-
         if (::renderer.isInitialized) {
-
             currentVideoTrack
                 ?.addSink(renderer)
-
         }
+
+        currentVideoTrack
+            ?.addSink(videoSizeSink)
     }
 
     override fun onDestroy() {
 
-
         if (::renderer.isInitialized) {
-
 
             currentVideoTrack
                 ?.removeSink(renderer)
 
-
             renderer.release()
-
         }
 
-
+        currentVideoTrack
+            ?.removeSink(videoSizeSink)
 
         currentVideoTrack = null
-
-
 
         super.onDestroy()
     }

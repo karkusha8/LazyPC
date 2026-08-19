@@ -1,12 +1,12 @@
 package com.example.lazypc.ui.screens
 
-import androidx.compose.ui.Alignment
 import android.content.res.Configuration
 import android.view.MotionEvent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -24,14 +24,15 @@ import com.example.lazypc.ui.components.BottomToolbar
 import org.webrtc.EglBase
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
-import androidx.compose.ui.unit.dp
-
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun RootScreen(
 
     eglContext: EglBase.Context,
+
+    videoWidth: Int,
+    videoHeight: Int,
 
     onSurfaceCreated:
         (SurfaceViewRenderer) -> Unit,
@@ -56,42 +57,60 @@ fun RootScreen(
 
     onDragModeChanged:
         (Boolean) -> Unit
-
 ) {
 
     var keyboardVisible by remember {
         mutableStateOf(false)
     }
 
-
     var dragModeEnabled by remember {
         mutableStateOf(false)
     }
 
-
     val configuration =
         LocalConfiguration.current
 
-
     val isLandscape =
-
         configuration.orientation ==
                 Configuration.ORIENTATION_LANDSCAPE
 
+    /*
+     * ================================================================
+     * REAL VIDEO ASPECT RATIO
+     *
+     * Пока WebRTC ещё не прислал первый кадр,
+     * используем 16:9 только как временный стартовый fallback.
+     *
+     * После первого кадра здесь будет реальное:
+     *
+     * 1920 / 1080
+     * 1366 / 768
+     * 1280 / 1024
+     * и т.д.
+     * ================================================================
+     */
+
+    val videoAspectRatio =
+        if (
+            videoWidth > 0 &&
+            videoHeight > 0
+        ) {
+            videoWidth.toFloat() /
+                    videoHeight.toFloat()
+        } else {
+            16f / 9f
+        }
 
     // ================================================================
     // LANDSCAPE
     // ================================================================
 
-
     if (isLandscape) {
 
         Column(
-
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)
-
         ) {
 
             // ========================================================
@@ -99,27 +118,33 @@ fun RootScreen(
             // ========================================================
 
             Box(
-
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(
-                        if (keyboardVisible) 0.40f else 1f
+                        if (keyboardVisible) {
+                            0.40f
+                        } else {
+                            1f
+                        }
                     )
                     .background(Color.Black)
                     .pointerInteropFilter { event ->
+
                         onTouch(event)
+
                         true
                     },
 
-                contentAlignment = Alignment.Center
-
+                contentAlignment =
+                    Alignment.Center
             ) {
 
                 Box(
-
                     modifier = Modifier
                         .fillMaxHeight()
-                        .aspectRatio(16f / 9f)
+                        .aspectRatio(
+                            videoAspectRatio
+                        )
                         .background(Color.Black)
                         .onSizeChanged { size ->
 
@@ -133,152 +158,9 @@ fun RootScreen(
                                 size.height.toFloat()
                             )
                         }
-
                 ) {
 
                     ScreenSurfaceView(
-
-                        modifier = Modifier.fillMaxSize(),
-
-                        eglContext = eglContext,
-
-                        onSurfaceReady = onSurfaceCreated,
-
-                        scalingType = RendererCommon.ScalingType.SCALE_ASPECT_FIT
-                    )
-
-                    LocalCursor(
-
-                        cursorState = cursorState,
-
-                        cursorScale = 0.8f
-                    )
-                }
-            }
-
-
-            // ========================================================
-            // KEYBOARD
-            // ========================================================
-
-            if (keyboardVisible) {
-
-                KeyboardScreen(
-
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(0.60f),
-
-                    keyboardEngine = keyboardEngine,
-
-                    keyboardEmitter = keyboardEmitter
-                )
-            }
-
-
-            // ========================================================
-            // TOOLBAR
-            // ========================================================
-
-            BottomToolbar(
-
-                keyboardVisible = keyboardVisible,
-
-                dragModeEnabled = dragModeEnabled,
-
-                onToggleKeyboard = {
-
-                    keyboardVisible = !keyboardVisible
-                },
-
-                onToggleDrag = {
-
-                    dragModeEnabled = !dragModeEnabled
-
-                    onDragModeChanged(dragModeEnabled)
-                }
-            )
-        }
-
-        return
-    }
-
-
-    // ================================================================
-    // PORTRAIT
-    // ================================================================
-
-
-    Column(
-
-        modifier = Modifier
-
-            .fillMaxSize()
-
-            .background(Color.Black)
-
-    ) {
-
-
-        Box(
-
-            modifier = Modifier
-
-                .fillMaxWidth()
-
-                .weight(1f)
-
-                .onSizeChanged { size ->
-
-                    onMouseAreaSizeChanged(
-
-                        size.width.toFloat(),
-
-                        size.height.toFloat()
-                    )
-                }
-
-                .pointerInteropFilter { event ->
-
-                    onTouch(event)
-
-                    true
-                }
-
-        ) {
-
-
-            Column(
-
-                modifier =
-                    Modifier.fillMaxSize()
-
-            ) {
-
-
-                Box(
-
-                    modifier = Modifier
-
-                        .fillMaxWidth()
-
-                        .aspectRatio(16f / 9f)
-
-                        .onSizeChanged { size ->
-
-                            onVideoAreaSizeChanged(
-
-                                size.width.toFloat(),
-
-                                size.height.toFloat()
-                            )
-                        }
-
-                ) {
-
-
-                    ScreenSurfaceView(
-
                         modifier =
                             Modifier.fillMaxSize(),
 
@@ -289,12 +171,137 @@ fun RootScreen(
                             onSurfaceCreated,
 
                         scalingType =
-                            RendererCommon.ScalingType.SCALE_ASPECT_FIT
+                            RendererCommon.ScalingType
+                                .SCALE_ASPECT_FIT
                     )
 
+                    LocalCursor(
+                        cursorState =
+                            cursorState,
+
+                        cursorScale =
+                            0.8f
+                    )
+                }
+            }
+
+            // ========================================================
+            // KEYBOARD
+            // ========================================================
+
+            if (keyboardVisible) {
+
+                KeyboardScreen(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(0.60f),
+
+                    keyboardEngine =
+                        keyboardEngine,
+
+                    keyboardEmitter =
+                        keyboardEmitter
+                )
+            }
+
+            // ========================================================
+            // TOOLBAR
+            // ========================================================
+
+            BottomToolbar(
+
+                keyboardVisible =
+                    keyboardVisible,
+
+                dragModeEnabled =
+                    dragModeEnabled,
+
+                onToggleKeyboard = {
+
+                    keyboardVisible =
+                        !keyboardVisible
+                },
+
+                onToggleDrag = {
+
+                    dragModeEnabled =
+                        !dragModeEnabled
+
+                    onDragModeChanged(
+                        dragModeEnabled
+                    )
+                }
+            )
+        }
+
+        return
+    }
+
+    // ================================================================
+    // PORTRAIT
+    // ================================================================
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .onSizeChanged { size ->
+
+                    onMouseAreaSizeChanged(
+                        size.width.toFloat(),
+                        size.height.toFloat()
+                    )
+                }
+                .pointerInteropFilter { event ->
+
+                    onTouch(event)
+
+                    true
+                }
+        ) {
+
+            Column(
+                modifier =
+                    Modifier.fillMaxSize()
+            ) {
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(
+                            videoAspectRatio
+                        )
+                        .onSizeChanged { size ->
+
+                            onVideoAreaSizeChanged(
+                                size.width.toFloat(),
+                                size.height.toFloat()
+                            )
+                        }
+                ) {
+
+                    ScreenSurfaceView(
+                        modifier =
+                            Modifier.fillMaxSize(),
+
+                        eglContext =
+                            eglContext,
+
+                        onSurfaceReady =
+                            onSurfaceCreated,
+
+                        scalingType =
+                            RendererCommon.ScalingType
+                                .SCALE_ASPECT_FIT
+                    )
 
                     LocalCursor(
-
                         cursorState =
                             cursorState,
 
@@ -303,26 +310,18 @@ fun RootScreen(
                     )
                 }
 
-
                 Box(
-
                     modifier = Modifier
-
                         .fillMaxWidth()
-
                         .weight(1f)
-
                         .background(Color.Black)
-
                 )
             }
         }
 
-
         if (keyboardVisible) {
 
             KeyboardScreen(
-
                 modifier =
                     Modifier.fillMaxHeight(0.4f),
 
@@ -333,7 +332,6 @@ fun RootScreen(
                     keyboardEmitter
             )
         }
-
 
         BottomToolbar(
 
@@ -354,7 +352,6 @@ fun RootScreen(
                 dragModeEnabled =
                     !dragModeEnabled
 
-
                 onDragModeChanged(
                     dragModeEnabled
                 )
@@ -365,104 +362,81 @@ fun RootScreen(
 
 @Composable
 private fun LocalCursor(
-
     cursorState: CursorState,
-
     cursorScale: Float = 1f
-
 ) {
 
     Canvas(
-
-        modifier = Modifier.fillMaxSize()
-
+        modifier =
+            Modifier.fillMaxSize()
     ) {
 
+        val s =
+            cursorScale
 
-        val s = cursorScale
+        val path =
+            Path().apply {
 
+                moveTo(
+                    cursorState.x,
+                    cursorState.y
+                )
 
-        val path = Path().apply {
+                lineTo(
+                    cursorState.x,
+                    cursorState.y +
+                            34f * s
+                )
 
+                lineTo(
+                    cursorState.x +
+                            10f * s,
+                    cursorState.y +
+                            25f * s
+                )
 
-            // Кончик стрелки Windows
-            moveTo(
-                cursorState.x,
-                cursorState.y
-            )
+                lineTo(
+                    cursorState.x +
+                            17f * s,
+                    cursorState.y +
+                            40f * s
+                )
 
+                lineTo(
+                    cursorState.x +
+                            23f * s,
+                    cursorState.y +
+                            37f * s
+                )
 
-            // Левая сторона вниз
-            lineTo(
-                cursorState.x,
-                cursorState.y + 34f * s
-            )
+                lineTo(
+                    cursorState.x +
+                            16f * s,
+                    cursorState.y +
+                            23f * s
+                )
 
+                lineTo(
+                    cursorState.x +
+                            30f * s,
+                    cursorState.y +
+                            23f * s
+                )
 
-            // Внутренний угол
-            lineTo(
-                cursorState.x + 10f * s,
-                cursorState.y + 25f * s
-            )
+                close()
+            }
 
-
-            // Нижняя часть ручки
-            lineTo(
-                cursorState.x + 17f * s,
-                cursorState.y + 40f * s
-            )
-
-
-            // Нижний правый угол ручки
-            lineTo(
-                cursorState.x + 23f * s,
-                cursorState.y + 37f * s
-            )
-
-
-            // Верх ручки
-            lineTo(
-                cursorState.x + 16f * s,
-                cursorState.y + 23f * s
-            )
-
-
-            // Правая часть стрелки
-            lineTo(
-                cursorState.x + 30f * s,
-                cursorState.y + 23f * s
-            )
-
-
-            // Закрываем стрелку
-            close()
-        }
-
-
-
-        // Чёрная обводка
         drawPath(
-
             path = path,
-
             color = Color.Black,
-
             style = Stroke(
-
                 width = 4f * s
-
             )
         )
 
-
-
-        // Белая заливка
         drawPath(
-
             path = path,
-
             color = Color.White
-
         )
     }
 }
