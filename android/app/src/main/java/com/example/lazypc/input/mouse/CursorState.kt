@@ -1,4 +1,4 @@
-package com.example.lazypc.input
+package com.example.lazypc.input.mouse
 
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf

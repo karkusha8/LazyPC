@@ -1,8 +1,8 @@
-package com.example.lazypc.keyboard.emit
+package com.example.lazypc.input.keyboard.emit
 
 import android.util.Log
-import com.example.lazypc.keyboard.core.KeyAction
-import com.example.lazypc.keyboard.core.KeyId
+import com.example.lazypc.input.keyboard.core.KeyAction
+import com.example.lazypc.input.keyboard.core.KeyId
 import com.example.lazypc.webrtc.WebRTCClient
 
 

@@ -1,9 +1,9 @@
-package com.example.lazypc.keyboard.mapping
+package com.example.lazypc.input.keyboard.mapping
 
-import com.example.lazypc.keyboard.core.KeyId
+import com.example.lazypc.input.keyboard.core.KeyId
 
 
-class LanguageRU : Language {
+class LanguageEN : Language {
 
     override fun map(
         keyId: KeyId,
@@ -16,34 +16,32 @@ class LanguageRU : Language {
             // LETTERS
             // ========================================================
 
-            KeyId.Q -> if (shift) "Й" else "й"
-            KeyId.W -> if (shift) "Ц" else "ц"
-            KeyId.E -> if (shift) "У" else "у"
-            KeyId.R -> if (shift) "К" else "к"
-            KeyId.T -> if (shift) "Е" else "е"
-            KeyId.Y -> if (shift) "Н" else "н"
-            KeyId.U -> if (shift) "Г" else "г"
-            KeyId.I -> if (shift) "Ш" else "ш"
-            KeyId.O -> if (shift) "Щ" else "щ"
-            KeyId.P -> if (shift) "З" else "з"
-
-            KeyId.A -> if (shift) "Ф" else "ф"
-            KeyId.S -> if (shift) "І" else "ы"
-            KeyId.D -> if (shift) "В" else "в"
-            KeyId.F -> if (shift) "А" else "а"
-            KeyId.G -> if (shift) "П" else "п"
-            KeyId.H -> if (shift) "Р" else "р"
-            KeyId.J -> if (shift) "О" else "о"
-            KeyId.K -> if (shift) "Л" else "л"
-            KeyId.L -> if (shift) "Д" else "д"
-
-            KeyId.Z -> if (shift) "Я" else "я"
-            KeyId.X -> if (shift) "Ч" else "ч"
-            KeyId.C -> if (shift) "С" else "с"
-            KeyId.V -> if (shift) "М" else "м"
-            KeyId.B -> if (shift) "И" else "и"
-            KeyId.N -> if (shift) "Т" else "т"
-            KeyId.M -> if (shift) "Ь" else "ь"
+            KeyId.A -> if (shift) "A" else "a"
+            KeyId.B -> if (shift) "B" else "b"
+            KeyId.C -> if (shift) "C" else "c"
+            KeyId.D -> if (shift) "D" else "d"
+            KeyId.E -> if (shift) "E" else "e"
+            KeyId.F -> if (shift) "F" else "f"
+            KeyId.G -> if (shift) "G" else "g"
+            KeyId.H -> if (shift) "H" else "h"
+            KeyId.I -> if (shift) "I" else "i"
+            KeyId.J -> if (shift) "J" else "j"
+            KeyId.K -> if (shift) "K" else "k"
+            KeyId.L -> if (shift) "L" else "l"
+            KeyId.M -> if (shift) "M" else "m"
+            KeyId.N -> if (shift) "N" else "n"
+            KeyId.O -> if (shift) "O" else "o"
+            KeyId.P -> if (shift) "P" else "p"
+            KeyId.Q -> if (shift) "Q" else "q"
+            KeyId.R -> if (shift) "R" else "r"
+            KeyId.S -> if (shift) "S" else "s"
+            KeyId.T -> if (shift) "T" else "t"
+            KeyId.U -> if (shift) "U" else "u"
+            KeyId.V -> if (shift) "V" else "v"
+            KeyId.W -> if (shift) "W" else "w"
+            KeyId.X -> if (shift) "X" else "x"
+            KeyId.Y -> if (shift) "Y" else "y"
+            KeyId.Z -> if (shift) "Z" else "z"
 
 
             // ========================================================
@@ -85,9 +83,11 @@ class LanguageRU : Language {
             KeyId.RBRACKET ->
                 if (shift) "}" else "]"
 
+
             KeyId.LCURLY -> "{"
 
             KeyId.RCURLY -> "}"
+
 
             KeyId.LPAREN -> "("
 
@@ -113,6 +113,7 @@ class LanguageRU : Language {
             KeyId.MINUS ->
                 if (shift) "_" else "-"
 
+
             KeyId.PLUS -> "+"
 
             KeyId.UNDERSCORE -> "_"
@@ -128,13 +129,16 @@ class LanguageRU : Language {
             KeyId.COMMA ->
                 if (shift) "<" else ","
 
+
             KeyId.COLON -> ":"
 
             KeyId.SEMICOLON ->
                 if (shift) ":" else ";"
 
+
             KeyId.QUOTE ->
                 if (shift) "\"" else "'"
+
 
             KeyId.QUESTION -> "?"
 
@@ -148,6 +152,7 @@ class LanguageRU : Language {
 
             KeyId.BACKSLASH ->
                 if (shift) "|" else "\\"
+
 
             KeyId.PIPE -> "|"
 

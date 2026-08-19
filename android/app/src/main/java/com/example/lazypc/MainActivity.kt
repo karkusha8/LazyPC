@@ -7,28 +7,28 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
-import com.example.lazypc.input.CursorState
-import com.example.lazypc.input.MouseEmitter
-import com.example.lazypc.input.PointerInputRouter
-import com.example.lazypc.input.events.GestureEvent
-import com.example.lazypc.input.gesture.ClientGestureEngine
-import com.example.lazypc.keyboard.core.ActionResolver
-import com.example.lazypc.keyboard.core.KeyboardEngine
-import com.example.lazypc.keyboard.emit.KeyboardEmitter
-import com.example.lazypc.keyboard.mapping.LanguageEN
-import com.example.lazypc.ui.screens.RootScreen
-import com.example.lazypc.webrtc.WebRTCClient
-import com.example.lazypc.network.WsClient
-import org.json.JSONObject
-import org.webrtc.EglBase
-import org.webrtc.IceCandidate
-import org.webrtc.SurfaceViewRenderer
-import org.webrtc.VideoFrame
-import org.webrtc.VideoSink
-import org.webrtc.VideoTrack
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.example.lazypc.input.mouse.CursorState
+import com.example.lazypc.input.mouse.MouseEmitter
+import com.example.lazypc.input.PointerInputRouter
+import com.example.lazypc.input.events.GestureEvent
+import com.example.lazypc.input.gesture.ClientGestureEngine
+import com.example.lazypc.input.keyboard.core.ActionResolver
+import com.example.lazypc.input.keyboard.core.KeyboardEngine
+import com.example.lazypc.input.keyboard.emit.KeyboardEmitter
+import com.example.lazypc.input.keyboard.mapping.LanguageEN
+import com.example.lazypc.network.WsClient
+import com.example.lazypc.ui.screens.RootScreen
+import com.example.lazypc.video.CustomVideoRenderer
+import com.example.lazypc.webrtc.WebRTCClient
+import org.json.JSONObject
+import org.webrtc.EglBase
+import org.webrtc.IceCandidate
+import org.webrtc.VideoFrame
+import org.webrtc.VideoSink
+import org.webrtc.VideoTrack
 
 class MainActivity : AppCompatActivity() {
 
@@ -44,14 +44,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ws: WsClient
     private lateinit var webrtc: WebRTCClient
 
-    private lateinit var renderer: SurfaceViewRenderer
+    private lateinit var renderer: CustomVideoRenderer
     private lateinit var eglBase: EglBase
 
     private var currentVideoTrack: VideoTrack? = null
-
-    // ================================================================
-    // REAL VIDEO SIZE
-    // ================================================================
 
     private var detectedVideoWidth by mutableIntStateOf(0)
     private var detectedVideoHeight by mutableIntStateOf(0)
@@ -60,15 +56,11 @@ class MainActivity : AppCompatActivity() {
     private var lastVideoHeight = 0
 
     private val videoSizeSink = object : VideoSink {
-
         override fun onFrame(frame: VideoFrame) {
-
             val width = frame.rotatedWidth
             val height = frame.rotatedHeight
 
-            if (width <= 0 || height <= 0) {
-                return
-            }
+            if (width <= 0 || height <= 0) return
 
             if (
                 width == lastVideoWidth &&
@@ -122,34 +114,22 @@ class MainActivity : AppCompatActivity() {
             window,
             window.decorView
         ).apply {
-            hide(
-                WindowInsetsCompat.Type.systemBars()
-            )
-
+            hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior =
                 WindowInsetsControllerCompat
                     .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
-        Log.d(
-            TAG_APP,
-            "🚀 LAZYPC START"
-        )
+        Log.d(TAG_APP, "🚀 LAZYPC START")
 
         eglBase = EglBase.create()
-
-        // ============================================================
-        // WEBRTC
-        // ============================================================
 
         webrtc = WebRTCClient(
             context = this,
             eglContext = eglBase.eglBaseContext,
 
             onFrame = { track ->
-
                 runOnUiThread {
-
                     if (currentVideoTrack === track) {
                         return@runOnUiThread
                     }
@@ -163,7 +143,6 @@ class MainActivity : AppCompatActivity() {
                         ?.removeSink(videoSizeSink)
 
                     currentVideoTrack = track
-
                     track.addSink(videoSizeSink)
 
                     if (!::renderer.isInitialized) {
@@ -175,7 +154,6 @@ class MainActivity : AppCompatActivity() {
             },
 
             onIce = { candidate ->
-
                 if (!::ws.isInitialized) {
                     return@WebRTCClient
                 }
@@ -184,15 +162,10 @@ class MainActivity : AppCompatActivity() {
                     put("type", "candidate")
                     put("candidate", candidate.sdp)
                     put("sdpMid", candidate.sdpMid)
-                    put(
-                        "sdpMLineIndex",
-                        candidate.sdpMLineIndex
-                    )
+                    put("sdpMLineIndex", candidate.sdpMLineIndex)
                 }
 
-                ws.sendText(
-                    json.toString()
-                )
+                ws.sendText(json.toString())
             },
 
             onCursorPosition = {
@@ -200,7 +173,6 @@ class MainActivity : AppCompatActivity() {
                     normalizedY ->
 
                 runOnUiThread {
-
                     cursorState.setNormalizedPosition(
                         normalizedX = normalizedX,
                         normalizedY = normalizedY,
@@ -214,12 +186,7 @@ class MainActivity : AppCompatActivity() {
         webrtc.init()
         webrtc.createPeerConnection()
 
-        // ============================================================
-        // MOUSE
-        // ============================================================
-
-        mouseEmitter =
-            MouseEmitter(webrtc)
+        mouseEmitter = MouseEmitter(webrtc)
 
         gestureEngine =
             ClientGestureEngine(
@@ -228,11 +195,8 @@ class MainActivity : AppCompatActivity() {
                 },
 
                 emit = { event ->
-
                     when (event) {
-
                         is GestureEvent.Move -> {
-
                             mouseEmitter.sendMove(
                                 event.dx,
                                 event.dy
@@ -263,7 +227,6 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         is GestureEvent.DragMove -> {
-
                             mouseEmitter.sendDragMove(
                                 event.dx,
                                 event.dy
@@ -282,27 +245,16 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         is GestureEvent.Scroll -> {
-                            mouseEmitter.sendScroll(
-                                event.dy
-                            )
+                            mouseEmitter.sendScroll(event.dy)
                         }
                     }
                 }
             )
 
         pointerInputRouter =
-            PointerInputRouter(
-                gestureEngine
-            )
+            PointerInputRouter(gestureEngine)
 
-        Log.d(
-            TAG_INPUT,
-            "✅ Mouse initialized"
-        )
-
-        // ============================================================
-        // KEYBOARD
-        // ============================================================
+        Log.d(TAG_INPUT, "✅ Mouse initialized")
 
         keyboardEngine =
             KeyboardEngine(
@@ -310,29 +262,16 @@ class MainActivity : AppCompatActivity() {
                 language = LanguageEN()
             )
 
-        keyboardEmitter =
-            KeyboardEmitter(
-                webrtc
-            )
-
-        // ============================================================
-        // UI
-        // ============================================================
+        keyboardEmitter = KeyboardEmitter(webrtc)
 
         setContent {
-
             RootScreen(
-                eglContext =
-                    eglBase.eglBaseContext,
+                eglContext = eglBase.eglBaseContext,
 
-                videoWidth =
-                    detectedVideoWidth,
-
-                videoHeight =
-                    detectedVideoHeight,
+                videoWidth = detectedVideoWidth,
+                videoHeight = detectedVideoHeight,
 
                 onSurfaceCreated = { surface ->
-
                     if (::renderer.isInitialized) {
                         currentVideoTrack
                             ?.removeSink(renderer)
@@ -348,34 +287,23 @@ class MainActivity : AppCompatActivity() {
                 },
 
                 onTouch = { event ->
-                    pointerInputRouter.onTouch(
-                        event
-                    )
+                    pointerInputRouter.onTouch(event)
                 },
 
-                cursorState =
-                    cursorState,
+                cursorState = cursorState,
 
                 onMouseAreaSizeChanged = {
                         width,
                         height ->
-
-                    mouseAreaWidth =
-                        width
-
-                    mouseAreaHeight =
-                        height
+                    mouseAreaWidth = width
+                    mouseAreaHeight = height
                 },
 
                 onVideoAreaSizeChanged = {
                         width,
                         height ->
-
-                    videoAreaWidth =
-                        width
-
-                    videoAreaHeight =
-                        height
+                    videoAreaWidth = width
+                    videoAreaHeight = height
 
                     cursorState.initialize(
                         width,
@@ -383,16 +311,11 @@ class MainActivity : AppCompatActivity() {
                     )
                 },
 
-                keyboardEngine =
-                    keyboardEngine,
-
-                keyboardEmitter =
-                    keyboardEmitter,
+                keyboardEngine = keyboardEngine,
+                keyboardEmitter = keyboardEmitter,
 
                 onDragModeChanged = { enabled ->
-
-                    dragModeEnabled =
-                        enabled
+                    dragModeEnabled = enabled
 
                     Log.d(
                         TAG_INPUT,
@@ -402,88 +325,49 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // ============================================================
-        // SIGNALING
-        // ============================================================
-
-        ws =
-            WsClient(
-                SIGNALING_URL
-            )
+        ws = WsClient(SIGNALING_URL)
 
         ws.setOnTextMessage { text ->
-
             if (!text.startsWith("{")) {
                 return@setOnTextMessage
             }
 
             try {
+                val json = JSONObject(text)
 
-                val json =
-                    JSONObject(text)
-
-                when (
-                    json.optString("type")
-                ) {
-
+                when (json.optString("type")) {
                     "offer" -> {
-
-                        val sdp =
-                            json.optString("sdp")
+                        val sdp = json.optString("sdp")
 
                         if (sdp.isEmpty()) {
                             return@setOnTextMessage
                         }
 
-                        webrtc.setRemoteOffer(
-                            sdp
-                        ) { answer ->
-
-                            ws.sendAnswer(
-                                answer
-                            )
+                        webrtc.setRemoteOffer(sdp) { answer ->
+                            ws.sendAnswer(answer)
                         }
                     }
 
                     "candidate" -> {
-
                         val candidateSdp =
-                            json.optString(
-                                "candidate"
-                            )
+                            json.optString("candidate")
 
-                        if (
-                            candidateSdp.isEmpty()
-                        ) {
+                        if (candidateSdp.isEmpty()) {
                             return@setOnTextMessage
                         }
 
                         val candidate =
                             IceCandidate(
-                                json.optString(
-                                    "sdpMid"
-                                ),
-                                json.optInt(
-                                    "sdpMLineIndex"
-                                ),
+                                json.optString("sdpMid"),
+                                json.optInt("sdpMLineIndex"),
                                 candidateSdp
                             )
 
-                        webrtc.addRemoteCandidate(
-                            candidate
-                        )
+                        webrtc.addRemoteCandidate(candidate)
                     }
                 }
-
-            } catch (
-                e: Exception
-            ) {
-
-                Log.e(
-                    TAG_WS,
-                    "SIGNALING ERROR",
-                    e
-                )
+            } catch (e: Exception) {
+                Log.e(TAG_WS, "SIGNALING ERROR", e)
             }
         }
 
@@ -492,44 +376,32 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-
-        Log.d(
-            TAG_APP,
-            "⏸ APP PAUSED"
-        )
+        Log.d(TAG_APP, "⏸ APP PAUSED")
     }
 
     override fun onResume() {
         super.onResume()
-
-        Log.d(
-            TAG_APP,
-            "▶ APP RESUMED"
-        )
+        Log.d(TAG_APP, "▶ APP RESUMED")
 
         if (::renderer.isInitialized) {
-            currentVideoTrack
-                ?.addSink(renderer)
+            currentVideoTrack?.addSink(renderer)
         }
 
-        currentVideoTrack
-            ?.addSink(videoSizeSink)
+        currentVideoTrack?.addSink(videoSizeSink)
     }
 
     override fun onDestroy() {
-
         if (::renderer.isInitialized) {
-
-            currentVideoTrack
-                ?.removeSink(renderer)
-
-            renderer.release()
+            currentVideoTrack?.removeSink(renderer)
+            renderer.releaseRenderer()
         }
 
-        currentVideoTrack
-            ?.removeSink(videoSizeSink)
-
+        currentVideoTrack?.removeSink(videoSizeSink)
         currentVideoTrack = null
+
+        if (::eglBase.isInitialized) {
+            eglBase.release()
+        }
 
         super.onDestroy()
     }

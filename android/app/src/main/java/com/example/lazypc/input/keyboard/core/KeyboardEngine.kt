@@ -1,18 +1,18 @@
-package com.example.lazypc.keyboard.core
+package com.example.lazypc.input.keyboard.core
 
 import android.os.SystemClock
 import android.util.Log
-import com.example.lazypc.keyboard.mapping.Language
-import com.example.lazypc.keyboard.mapping.LanguageEN
-import com.example.lazypc.keyboard.mapping.LanguageRU
+import com.example.lazypc.input.keyboard.mapping.Language
+import com.example.lazypc.input.keyboard.mapping.LanguageEN
+import com.example.lazypc.input.keyboard.mapping.LanguageRU
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 
 class KeyboardEngine(
-    private val resolver: ActionResolver,
-    language: Language
+    private val resolver: com.example.lazypc.input.keyboard.core.ActionResolver,
+    language: com.example.lazypc.input.keyboard.mapping.Language
 ) {
 
     companion object {
@@ -28,9 +28,9 @@ class KeyboardEngine(
     // ================================================================
 
     private val _currentLayer =
-        MutableStateFlow(KeyboardLayer.TEXT)
+        MutableStateFlow(com.example.lazypc.input.keyboard.core.KeyboardLayer.TEXT)
 
-    val currentLayer: StateFlow<KeyboardLayer> =
+    val currentLayer: StateFlow<com.example.lazypc.input.keyboard.core.KeyboardLayer> =
         _currentLayer.asStateFlow()
 
 
@@ -41,7 +41,7 @@ class KeyboardEngine(
     private val _currentLanguage =
         MutableStateFlow(language)
 
-    val currentLanguage: StateFlow<Language> =
+    val currentLanguage: StateFlow<com.example.lazypc.input.keyboard.mapping.Language> =
         _currentLanguage.asStateFlow()
 
 
@@ -75,7 +75,7 @@ class KeyboardEngine(
     // ================================================================
 
     fun setLayer(
-        layer: KeyboardLayer
+        layer: com.example.lazypc.input.keyboard.core.KeyboardLayer
     ) {
 
         Log.d(
@@ -97,14 +97,14 @@ class KeyboardEngine(
 
             when (_currentLanguage.value) {
 
-                is LanguageEN ->
-                    LanguageRU()
+                is com.example.lazypc.input.keyboard.mapping.LanguageEN ->
+                    com.example.lazypc.input.keyboard.mapping.LanguageRU()
 
-                is LanguageRU ->
-                    LanguageEN()
+                is com.example.lazypc.input.keyboard.mapping.LanguageRU ->
+                    com.example.lazypc.input.keyboard.mapping.LanguageEN()
 
                 else ->
-                    LanguageEN()
+                    com.example.lazypc.input.keyboard.mapping.LanguageEN()
             }
 
 
@@ -127,10 +127,10 @@ class KeyboardEngine(
 
         return when (_currentLanguage.value) {
 
-            is LanguageEN ->
+            is com.example.lazypc.input.keyboard.mapping.LanguageEN ->
                 "EN"
 
-            is LanguageRU ->
+            is com.example.lazypc.input.keyboard.mapping.LanguageRU ->
                 "RU"
 
             else ->
@@ -144,8 +144,8 @@ class KeyboardEngine(
     // ================================================================
 
     fun handleKey(
-        keyId: KeyId
-    ): KeyAction? {
+        keyId: com.example.lazypc.input.keyboard.core.KeyId
+    ): com.example.lazypc.input.keyboard.core.KeyAction? {
 
 
         Log.d(
@@ -161,10 +161,10 @@ class KeyboardEngine(
             // TEXT LAYER
             // ========================================================
 
-            KeyId.SWITCH_TEXT -> {
+           com.example.lazypc.input.keyboard.core.KeyId.SWITCH_TEXT -> {
 
                 setLayer(
-                    KeyboardLayer.TEXT
+                    com.example.lazypc.input.keyboard.core.KeyboardLayer.TEXT
                 )
 
                 return null
@@ -175,10 +175,10 @@ class KeyboardEngine(
             // SYMBOL LAYER
             // ========================================================
 
-            KeyId.SWITCH_CODE -> {
+          com.example.lazypc.input.keyboard.core.KeyId.SWITCH_CODE -> {
 
                 setLayer(
-                    KeyboardLayer.CODE
+                    com.example.lazypc.input.keyboard.core.KeyboardLayer.CODE
                 )
 
                 return null
@@ -189,10 +189,10 @@ class KeyboardEngine(
             // SYSTEM / DEV LAYER
             // ========================================================
 
-            KeyId.SWITCH_SYS -> {
+            com.example.lazypc.input.keyboard.core.KeyId.SWITCH_SYS -> {
 
                 setLayer(
-                    KeyboardLayer.SYS
+                    com.example.lazypc.input.keyboard.core.KeyboardLayer.SYS
                 )
 
                 return null
@@ -203,7 +203,7 @@ class KeyboardEngine(
             // SHIFT
             // ========================================================
 
-            KeyId.SHIFT -> {
+           com.example.lazypc.input.keyboard.core.KeyId.SHIFT -> {
 
 
                 val now =

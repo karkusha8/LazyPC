@@ -1,4 +1,4 @@
-package com.example.lazypc.keyboard.ui
+package com.example.lazypc.input.keyboard.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -14,11 +14,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.lazypc.keyboard.core.*
-import com.example.lazypc.keyboard.emit.KeyboardEmitter
-import com.example.lazypc.keyboard.layout.KeyboardLayouts
-import com.example.lazypc.keyboard.mapping.LanguageEN
-import com.example.lazypc.keyboard.mapping.LanguageRU
+import com.example.lazypc.input.keyboard.core.KeyboardEngine
+import com.example.lazypc.input.keyboard.core.*
+import com.example.lazypc.input.keyboard.emit.KeyboardEmitter
+import com.example.lazypc.input.keyboard.layout.KeyboardLayouts
+import com.example.lazypc.input.keyboard.mapping.LanguageEN
+import com.example.lazypc.input.keyboard.mapping.LanguageRU
 
 
 @Composable

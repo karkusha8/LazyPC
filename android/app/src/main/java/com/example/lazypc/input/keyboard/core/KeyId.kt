@@ -1,4 +1,4 @@
-package com.example.lazypc.keyboard.core
+package com.example.lazypc.input.keyboard.core
 
 enum class KeyId {
 

@@ -1,4 +1,4 @@
-package com.example.lazypc.keyboard.ui
+package com.example.lazypc.input.keyboard.ui
 
 import android.util.Log
 import androidx.compose.foundation.background
@@ -14,7 +14,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.lazypc.keyboard.core.KeyId
+import com.example.lazypc.input.keyboard.core.KeyId
 
 
 @Composable

@@ -1,6 +1,7 @@
-package com.example.lazypc.keyboard.layout
+package com.example.lazypc.input.keyboard.layout
 
-import com.example.lazypc.keyboard.core.KeyId
+import com.example.lazypc.input.keyboard.core.KeyId
+
 
 data class KeyRow(
     val keys: List<KeyId>

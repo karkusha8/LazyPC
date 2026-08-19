@@ -1,4 +1,4 @@
-package com.example.lazypc.input
+package com.example.lazypc.input.mouse
 
 import com.example.lazypc.webrtc.WebRTCClient
 import java.nio.ByteBuffer
