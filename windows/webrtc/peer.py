@@ -17,6 +17,17 @@ from aiortc import (
 
 from aiortc.rtcrtpsender import RTCRtpSender
 
+# LazyPC NVENC integration.
+# RTCRtpSender does not look up H264Encoder dynamically; it calls the
+# module-level get_encoder(codec). Patch that function instead.
+from webrtc.encoder_factory import get_encoder as lazy_get_encoder
+import aiortc.rtcrtpsender as _rtcrtpsender
+import aiortc.codecs as _codecs
+
+_rtcrtpsender.get_encoder = lazy_get_encoder
+_codecs.get_encoder = lazy_get_encoder
+
+
 
 # ================================================================
 # CURSOR PROTOCOL
