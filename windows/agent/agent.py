@@ -170,6 +170,9 @@ class Agent:
             "[AGENT] Signaling disconnected"
         )
 
+        # The client may disappear without sending final KEY UP packets.
+        self.keyboard_state.release_all()
+
         self._closed_event.set()
     # ================================================================
     # INPUT PACKET
@@ -278,6 +281,9 @@ class Agent:
     async def _on_peer_closed(self):
 
         print("[AGENT] Peer disconnected")
+
+        # WebRTC can disappear before Android sends KEY UP.
+        self.keyboard_state.release_all()
 
         await self.peer.stop_session()
 

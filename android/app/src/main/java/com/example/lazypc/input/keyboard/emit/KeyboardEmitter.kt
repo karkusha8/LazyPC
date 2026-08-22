@@ -35,6 +35,10 @@ class KeyboardEmitter(
             0x53
 
 
+        private const val PACKET_MODIFIER =
+            0x54
+
+
         const val LANG_EN =
             0
 
@@ -97,6 +101,18 @@ class KeyboardEmitter(
             is KeyAction.Shortcut -> {
 
                 sendShortcut(
+                    action
+                )
+            }
+
+
+            // ========================================================
+            // MODIFIER
+            // ========================================================
+
+            is KeyAction.Modifier -> {
+
+                sendModifier(
                     action
                 )
             }
@@ -247,6 +263,30 @@ class KeyboardEmitter(
         send(
             packet
         )
+    }
+
+
+    // ================================================================
+    // MODIFIER
+    // ================================================================
+
+    fun sendModifier(
+        action: KeyAction.Modifier
+    ) {
+
+        val packet =
+            byteArrayOf(
+                PACKET_MODIFIER.toByte(),
+                action.keyId.ordinal.toByte(),
+                if (action.pressed) 1 else 0
+            )
+
+        Log.d(
+            TAG,
+            "TX MODIFIER -> ${action.keyId} ${if (action.pressed) "DOWN" else "UP"}"
+        )
+
+        send(packet)
     }
 
 

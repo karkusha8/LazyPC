@@ -16,6 +16,9 @@ class KeyboardState:
 
         self.language = LANG_EN
 
+        # Modifiers currently held on Windows.
+        # This is used to guarantee KEY UP on disconnect.
+        self._held_modifiers = set()
 
         print(
             "[KEYBOARD] KeyboardState initialized"
@@ -132,3 +135,91 @@ class KeyboardState:
 
             key_id
         )
+
+
+    # ============================================================
+    # MODIFIER
+    # ============================================================
+
+
+    def modifier(
+        self,
+        key_id: int,
+        pressed: bool
+    ):
+
+        if pressed:
+
+            # Do not send duplicate KEY DOWN packets if the same
+            # modifier is already held.
+            if key_id in self._held_modifiers:
+                return
+
+            self._held_modifiers.add(key_id)
+
+            self.backend.key_down(
+                key_id
+            )
+
+            print(
+                f"[KEYBOARD] KEY DOWN -> {key_id}"
+            )
+
+            return
+
+
+        # KEY UP
+        if key_id not in self._held_modifiers:
+            return
+
+        self._held_modifiers.discard(
+            key_id
+        )
+
+        self.backend.key_up(
+            key_id
+        )
+
+        print(
+            f"[KEYBOARD] KEY UP -> {key_id}"
+        )
+
+
+    # ============================================================
+    # RELEASE ALL HELD MODIFIERS
+    # ============================================================
+
+
+    def release_all(
+        self
+    ):
+
+        if not self._held_modifiers:
+            return
+
+        held = list(
+            self._held_modifiers
+        )
+
+        print(
+            f"[KEYBOARD] RELEASE ALL -> {held}"
+        )
+
+        self._held_modifiers.clear()
+
+        for key_id in held:
+
+            try:
+
+                self.backend.key_up(
+                    key_id
+                )
+
+            except Exception as e:
+
+                print(
+                    "[KEYBOARD] Failed to release",
+                    key_id,
+                    ":",
+                    e
+                )

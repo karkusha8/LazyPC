@@ -16,4 +16,10 @@ sealed class KeyAction {
         val modifier: com.example.lazypc.input.keyboard.core.KeyId,
         val key: com.example.lazypc.input.keyboard.core.KeyId
     ) : KeyAction()
+
+    // ⌨️ удерживаемый модификатор
+    data class Modifier(
+        val keyId: com.example.lazypc.input.keyboard.core.KeyId,
+        val pressed: Boolean
+    ) : KeyAction()
 }

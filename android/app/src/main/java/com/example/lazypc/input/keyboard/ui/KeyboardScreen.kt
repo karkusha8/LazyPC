@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,48 +22,62 @@ import com.example.lazypc.input.keyboard.layout.KeyboardLayouts
 import com.example.lazypc.input.keyboard.mapping.LanguageEN
 import com.example.lazypc.input.keyboard.mapping.LanguageRU
 
-
 @Composable
 fun KeyboardScreen(
-
     keyboardEngine: KeyboardEngine,
-
     keyboardEmitter: KeyboardEmitter,
-
     modifier: Modifier = Modifier
-
 ) {
-
     val shift by
     keyboardEngine
         .shiftEnabled
         .collectAsStateWithLifecycle()
-
 
     val caps by
     keyboardEngine
         .capsLockEnabled
         .collectAsStateWithLifecycle()
 
+    val ctrl by
+    keyboardEngine
+        .ctrlEnabled
+        .collectAsStateWithLifecycle()
+
+    val alt by
+    keyboardEngine
+        .altEnabled
+        .collectAsStateWithLifecycle()
 
     val layer by
     keyboardEngine
         .currentLayer
         .collectAsStateWithLifecycle()
 
-
     val language by
     keyboardEngine
         .currentLanguage
         .collectAsStateWithLifecycle()
 
+    fun releaseModifiers() {
+        keyboardEngine
+            .releaseActiveModifiers()
+            .forEach { keyboardEmitter.emit(it) }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            releaseModifiers()
+        }
+    }
 
     val layout =
-
         when (layer) {
-
             KeyboardLayer.TEXT ->
-                KeyboardLayouts.MAIN_TEXT
+                if (language is LanguageRU) {
+                    KeyboardLayouts.SLAVIC_TEXT
+                } else {
+                    KeyboardLayouts.MAIN_TEXT
+                }
 
             KeyboardLayer.CODE ->
                 KeyboardLayouts.MAIN_SYMBOLS
@@ -71,214 +86,119 @@ fun KeyboardScreen(
                 KeyboardLayouts.DEV
         }
 
-
     Column(
-
         modifier = modifier
-
             .fillMaxWidth()
-
-            .background(
-                Color(0xFF1E1E1E)
-            )
-
+            .background(Color(0xFF1E1E1E))
     ) {
-
-
         Row(
-
             modifier = Modifier
-
                 .fillMaxWidth()
-
                 .height(48.dp)
-
-                .padding(
-                    horizontal = 8.dp
-                ),
-
-            verticalAlignment =
-                Alignment.CenterVertically
-
+                .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-
-
             TabItem(
-
                 title = "ABC",
-
-                active =
-                    layer != KeyboardLayer.SYS
-
+                active = layer != KeyboardLayer.SYS
             ) {
-
-                keyboardEngine.setLayer(
-                    KeyboardLayer.TEXT
-                )
+                releaseModifiers()
+                keyboardEngine.setLayer(KeyboardLayer.TEXT)
             }
-
 
             TabItem(
-
                 title = "DEV",
-
-                active =
-                    layer == KeyboardLayer.SYS
-
+                active = layer == KeyboardLayer.SYS
             ) {
-
-                keyboardEngine.setLayer(
-                    KeyboardLayer.SYS
-                )
+                releaseModifiers()
+                keyboardEngine.setLayer(KeyboardLayer.SYS)
             }
-
 
             LanguageItem(
-
                 title =
-
                     when (language) {
-
-                        is LanguageRU ->
-                            "RU"
-
-                        is LanguageEN ->
-                            "EN"
-
-                        else ->
-                            "EN"
+                        is LanguageRU -> "RU"
+                        is LanguageEN -> "EN"
+                        else -> "EN"
                     }
-
             ) {
-
-                keyboardEngine
-                    .switchLanguage()
+                releaseModifiers()
+                keyboardEngine.switchLanguage()
             }
         }
 
-
-        Spacer(
-
-            modifier =
-                Modifier.height(4.dp)
-        )
-
+        Spacer(modifier = Modifier.height(4.dp))
 
         Column(
-
             modifier = Modifier
-
                 .fillMaxSize()
-
                 .padding(4.dp)
-
         ) {
-
-
             layout.forEach { row ->
-
-
                 Row(
-
                     modifier = Modifier
-
                         .fillMaxWidth()
-
                         .weight(1f)
-
                 ) {
-
-
                     row.forEach { key ->
-
-
                         val baseLabel =
-
                             labelForKey(
-
                                 key.id,
-
                                 language
                             )
 
-
                         val displayLabel =
-
                             when {
-
                                 baseLabel.length == 1 &&
                                         baseLabel[0].isLetter() -> {
-
                                     if (shift || caps)
-
                                         baseLabel.uppercase()
-
                                     else
-
                                         baseLabel.lowercase()
                                 }
-
 
                                 else ->
                                     baseLabel
                             }
 
-
                         val isShiftKey =
+                            key.id == KeyId.SHIFT
 
-                            key.id ==
-                                    KeyId.SHIFT
+                        val isCtrlKey =
+                            key.id == KeyId.CTRL
 
+                        val isAltKey =
+                            key.id == KeyId.ALT
 
                         val bgColor =
-
                             when {
-
                                 isShiftKey && caps ->
-
                                     Color(0xFF4CAF50)
 
-
                                 isShiftKey && shift ->
-
                                     Color(0xFF2196F3)
 
+                                isCtrlKey && ctrl ->
+                                    Color(0xFF4CAF50)
+
+                                isAltKey && alt ->
+                                    Color(0xFF4CAF50)
 
                                 else ->
-
                                     Color(0xFF2A2A2A)
                             }
 
-
                         KeyButton(
-
-                            keyId =
-                                key.id,
-
-                            label =
-                                displayLabel,
-
-                            weight =
-                                key.width,
-
-                            backgroundColor =
-                                bgColor
-
+                            keyId = key.id,
+                            label = displayLabel,
+                            weight = key.width,
+                            backgroundColor = bgColor
                         ) { pressedKey ->
-
-
                             val action =
-
-                                keyboardEngine
-                                    .handleKey(
-                                        pressedKey
-                                    )
-
+                                keyboardEngine.handleKey(pressedKey)
 
                             action?.let {
-
-                                keyboardEmitter
-                                    .emit(it)
+                                keyboardEmitter.emit(it)
                             }
                         }
                     }
@@ -288,86 +208,45 @@ fun KeyboardScreen(
     }
 }
 
-
 @Composable
 fun RowScope.KeyButton(
-
     keyId: KeyId,
-
     label: String,
-
     weight: Float,
-
-    backgroundColor: Color =
-        Color(0xFF2A2A2A),
-
+    backgroundColor: Color = Color(0xFF2A2A2A),
     onClick: (KeyId) -> Unit
-
 ) {
-
     Box(
-
         modifier = Modifier
-
             .weight(weight)
-
             .fillMaxHeight()
-
             .padding(2.dp)
-
             .background(
-
                 backgroundColor,
-
                 RoundedCornerShape(8.dp)
             )
-
             .clickable {
-
                 onClick(keyId)
             },
-
-        contentAlignment =
-            Alignment.Center
-
+        contentAlignment = Alignment.Center
     ) {
-
         Text(
-
-            text =
-                label,
-
-            color =
-                Color.White,
-
-            fontSize =
-                16.sp,
-
-            fontWeight =
-                FontWeight.Medium
+            text = label,
+            color = Color.White,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Medium
         )
     }
 }
 
-
 fun labelForKey(
-
     key: KeyId,
-
     language: Any
-
 ): String {
-
-
     val letterLabel =
-
         when (language) {
-
-
             is LanguageRU ->
-
                 when (key) {
-
                     KeyId.Q -> "й"
                     KeyId.W -> "ц"
                     KeyId.E -> "у"
@@ -397,15 +276,19 @@ fun labelForKey(
                     KeyId.N -> "т"
                     KeyId.M -> "ь"
 
-                    else ->
-                        null
+                    KeyId.SLAVIC_1 -> "б"
+                    KeyId.SLAVIC_2 -> "ж"
+                    KeyId.SLAVIC_3 -> "х"
+                    KeyId.SLAVIC_4 -> "ъ"
+                    KeyId.SLAVIC_5 -> "э"
+                    KeyId.SLAVIC_6 -> "ю"
+                    KeyId.SLAVIC_7 -> "ё"
+
+                    else -> null
                 }
 
-
             else ->
-
                 when (key) {
-
                     KeyId.Q -> "q"
                     KeyId.W -> "w"
                     KeyId.E -> "e"
@@ -435,20 +318,15 @@ fun labelForKey(
                     KeyId.N -> "n"
                     KeyId.M -> "m"
 
-                    else ->
-                        null
+                    else -> null
                 }
         }
 
-
     if (letterLabel != null) {
-
         return letterLabel
     }
 
-
     return when (key) {
-
         KeyId.DIGIT_0 -> "0"
         KeyId.DIGIT_1 -> "1"
         KeyId.DIGIT_2 -> "2"
@@ -493,23 +371,16 @@ fun labelForKey(
         KeyId.BACKSLASH -> "\\"
 
         KeyId.PIPE -> "|"
-
         KeyId.QUESTION -> "?"
 
         KeyId.ENTER -> "⏎"
-
         KeyId.BACKSPACE -> "⌫"
-
         KeyId.SHIFT -> "⇧"
-
         KeyId.TAB -> "TAB"
-
         KeyId.SPACE -> "SPACE"
 
         KeyId.SWITCH_TEXT -> "ABC"
-
         KeyId.SWITCH_CODE -> "123"
-
         KeyId.SWITCH_SYS -> "DEV"
 
         KeyId.LEFT -> "←"
@@ -517,154 +388,79 @@ fun labelForKey(
         KeyId.UP -> "↑"
         KeyId.DOWN -> "↓"
 
-        else ->
-            key.name
+        else -> key.name
     }
 }
 
-
 @Composable
 private fun RowScope.TabItem(
-
     title: String,
-
     active: Boolean,
-
     onClick: () -> Unit
-
 ) {
-
     Column(
-
         modifier = Modifier
-
             .weight(1f)
-
             .fillMaxHeight()
-
-            .clickable {
-
-                onClick()
-            },
-
-        horizontalAlignment =
-            Alignment.CenterHorizontally,
-
-        verticalArrangement =
-            Arrangement.Center
-
+            .clickable { onClick() },
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
-
         Text(
-
-            text =
-                title,
-
+            text = title,
             color =
-
-                if (active)
-
-                    Color.White
-
-                else
-
-                    Color.Gray,
-
+                if (active) Color.White
+                else Color.Gray,
             fontWeight =
-
                 if (active)
-
                     FontWeight.SemiBold
-
                 else
-
                     FontWeight.Normal
         )
 
-
-        Spacer(
-
-            modifier =
-                Modifier.height(6.dp)
-        )
-
+        Spacer(modifier = Modifier.height(6.dp))
 
         Box(
-
             modifier = Modifier
-
                 .height(2.dp)
-
                 .fillMaxWidth(0.5f)
-
                 .background(
-
                     if (active)
-
                         Color.White
-
                     else
-
                         Color.Transparent,
-
                     RoundedCornerShape(1.dp)
                 )
         )
     }
 }
 
-
 @Composable
 private fun RowScope.LanguageItem(
-
     title: String,
-
     onClick: () -> Unit
-
 ) {
-
     Box(
-
         modifier = Modifier
-
             .weight(0.55f)
-
             .fillMaxHeight()
-
             .padding(
-
                 horizontal = 4.dp,
-
                 vertical = 5.dp
             )
-
             .background(
-
                 Color(0xFF2A2A2A),
-
                 RoundedCornerShape(8.dp)
             )
-
             .clickable {
-
                 onClick()
             },
-
-        contentAlignment =
-            Alignment.Center
-
+        contentAlignment = Alignment.Center
     ) {
-
         Text(
-
-            text =
-                "🌐 $title",
-
-            color =
-                Color.White,
-
-            fontWeight =
-                FontWeight.SemiBold
+            text = "🌐 $title",
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold
         )
     }
 }

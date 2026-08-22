@@ -21,6 +21,23 @@ VK = {
     "alt": 0x12,
     "shift": 0x10,
 
+    "tab": 0x09,
+    "enter": 0x0D,
+    "backspace": 0x08,
+    "esc": 0x1B,
+    "delete": 0x2E,
+    "home": 0x24,
+    "end": 0x23,
+    "left": 0x25,
+    "up": 0x26,
+    "right": 0x27,
+    "down": 0x28,
+    "f4": 0x73,
+    "f5": 0x74,
+    "f9": 0x78,
+    "f10": 0x79,
+    "f11": 0x7A,
+
     "a": 0x41,
     "b": 0x42,
     "c": 0x43,
@@ -216,6 +233,14 @@ KEY_ID_NAMES = [
     "n", "o", "p", "q", "r", "s",
     "t", "u", "v", "w", "x", "y", "z",
 
+    "slavic_1",
+    "slavic_2",
+    "slavic_3",
+    "slavic_4",
+    "slavic_5",
+    "slavic_6",
+    "slavic_7",
+
     "0", "1", "2", "3", "4",
     "5", "6", "7", "8", "9",
 
@@ -302,11 +327,11 @@ KEY_ID_NAMES = [
 
 MODIFIER_NAMES = {
 
-    66: "ctrl",
+    71: "shift",
 
-    67: "alt",
+    73: "ctrl",
 
-    64: "shift",
+    74: "alt",
 }
 
 
@@ -757,6 +782,49 @@ class WindowsBackend:
 
         self._key_down_vk(vk)
         self._key_up_vk(vk)
+
+    # Public keyboard primitives used by KeyboardState.
+    # Keep these as thin wrappers around the existing SendInput path.
+    def key_down(self, key_id: int):
+        self._key_down_vk(self._vk_for_key_id(key_id))
+
+    def key_up(self, key_id: int):
+        self._key_up_vk(self._vk_for_key_id(key_id))
+
+    def _vk_for_key_id(self, key_id: int):
+        if key_id < 0 or key_id >= len(KEY_ID_NAMES):
+            raise ValueError(f"Unknown KeyId: {key_id}")
+
+        key = KEY_ID_NAMES[key_id]
+        vk = VK.get(key)
+
+        if vk is None:
+            raise ValueError(f"Unsupported key: {key}")
+
+        return vk
+
+    # Public keyboard primitives used by KeyboardState.
+    # KeyboardState calls these for held keys/modifiers.
+    def key_down(self, key_id: int):
+        vk = self._vk_for_key_id(key_id)
+        self._key_down_vk(vk)
+
+    def key_up(self, key_id: int):
+        vk = self._vk_for_key_id(key_id)
+        self._key_up_vk(vk)
+
+    def _vk_for_key_id(self, key_id: int):
+        if key_id < 0 or key_id >= len(KEY_ID_NAMES):
+            raise ValueError(f"Unknown KeyId: {key_id}")
+
+        key = KEY_ID_NAMES[key_id]
+        vk = VK.get(key)
+
+        if vk is None:
+            raise ValueError(f"Unsupported key: {key}")
+
+        return vk
+
     # ============================================================
     # UNICODE TEXT VIA SENDINPUT
     # ============================================================
@@ -1072,13 +1140,22 @@ class WindowsBackend:
             print("[KEYBOARD] Unsupported shortcut")
             return
 
-        print(f"[KEYBOARD] SHORTCUT -> {modifier} + {key}")
+        print(
+            f"[KEYBOARD] SHORTCUT -> "
+            f"{modifier} + {key}"
+        )
 
-        self.user32.keybd_event(mod_vk, 0, 0, 0)
-        self.user32.keybd_event(key_vk, 0, 0, 0)
-
-        self.user32.keybd_event(key_vk, 0, KEYEVENTF_KEYUP, 0)
-        self.user32.keybd_event(mod_vk, 0, KEYEVENTF_KEYUP, 0)
+        # Same SendInput path as held modifiers.
+        # Exact order:
+        # MODIFIER DOWN -> KEY DOWN -> KEY UP -> MODIFIER UP.
+        try:
+            self._key_down_vk(mod_vk)
+            try:
+                self._key_down_vk(key_vk)
+            finally:
+                self._key_up_vk(key_vk)
+        finally:
+            self._key_up_vk(mod_vk)
 
 
     # ============================================================

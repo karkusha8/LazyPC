@@ -1,6 +1,6 @@
 package com.example.lazypc.input.keyboard.mapping
-import com.example.lazypc.input.keyboard.core.KeyId
 
+import com.example.lazypc.input.keyboard.core.KeyId
 
 class LanguageRU : Language {
 
@@ -12,7 +12,7 @@ class LanguageRU : Language {
         return when (keyId) {
 
             // ========================================================
-            // LETTERS
+            // RUSSIAN / SLAVIC LETTERS
             // ========================================================
 
             KeyId.Q -> if (shift) "Й" else "й"
@@ -27,7 +27,7 @@ class LanguageRU : Language {
             KeyId.P -> if (shift) "З" else "з"
 
             KeyId.A -> if (shift) "Ф" else "ф"
-            KeyId.S -> if (shift) "І" else "ы"
+            KeyId.S -> if (shift) "Ы" else "ы"
             KeyId.D -> if (shift) "В" else "в"
             KeyId.F -> if (shift) "А" else "а"
             KeyId.G -> if (shift) "П" else "п"
@@ -44,6 +44,15 @@ class LanguageRU : Language {
             KeyId.N -> if (shift) "Т" else "т"
             KeyId.M -> if (shift) "Ь" else "ь"
 
+            // Additional Cyrillic slots.
+            // These are shared by Slavic layouts such as RU/UK.
+            KeyId.SLAVIC_1 -> if (shift) "Б" else "б"
+            KeyId.SLAVIC_2 -> if (shift) "Ж" else "ж"
+            KeyId.SLAVIC_3 -> if (shift) "Х" else "х"
+            KeyId.SLAVIC_4 -> if (shift) "Ъ" else "ъ"
+            KeyId.SLAVIC_5 -> if (shift) "Э" else "э"
+            KeyId.SLAVIC_6 -> if (shift) "Ю" else "ю"
+            KeyId.SLAVIC_7 -> if (shift) "Ё" else "ё"
 
             // ========================================================
             // DIGITS
@@ -60,103 +69,74 @@ class LanguageRU : Language {
             KeyId.DIGIT_8 -> if (shift) "*" else "8"
             KeyId.DIGIT_9 -> if (shift) "(" else "9"
 
-
             // ========================================================
             // DIRECT SYMBOLS
             // ========================================================
 
             KeyId.AT -> "@"
-
             KeyId.HASH -> "#"
-
             KeyId.DOLLAR -> "$"
-
             KeyId.PERCENT -> "%"
-
 
             // ========================================================
             // BRACKETS
             // ========================================================
 
-            KeyId.LBRACKET ->
-                if (shift) "{" else "["
-
-            KeyId.RBRACKET ->
-                if (shift) "}" else "]"
+            KeyId.LBRACKET -> if (shift) "{" else "["
+            KeyId.RBRACKET -> if (shift) "}" else "]"
 
             KeyId.LCURLY -> "{"
-
             KeyId.RCURLY -> "}"
 
             KeyId.LPAREN -> "("
-
             KeyId.RPAREN -> ")"
-
 
             // ========================================================
             // COMPARISON
             // ========================================================
 
             KeyId.LESS -> "<"
-
             KeyId.GREATER -> ">"
-
 
             // ========================================================
             // OPERATORS
             // ========================================================
 
-            KeyId.EQUALS ->
-                if (shift) "+" else "="
-
-            KeyId.MINUS ->
-                if (shift) "_" else "-"
+            KeyId.EQUALS -> if (shift) "+" else "="
+            KeyId.MINUS -> if (shift) "_" else "-"
 
             KeyId.PLUS -> "+"
-
             KeyId.UNDERSCORE -> "_"
-
 
             // ========================================================
             // PUNCTUATION
             // ========================================================
 
-            KeyId.DOT ->
-                if (shift) ">" else "."
-
-            KeyId.COMMA ->
-                if (shift) "<" else ","
+            KeyId.DOT -> if (shift) ">" else "."
+            KeyId.COMMA -> if (shift) "<" else ","
 
             KeyId.COLON -> ":"
+            KeyId.SEMICOLON -> if (shift) ":" else ";"
 
-            KeyId.SEMICOLON ->
-                if (shift) ":" else ";"
-
-            KeyId.QUOTE ->
-                if (shift) "\"" else "'"
+            KeyId.QUOTE -> if (shift) "\"" else "'"
 
             KeyId.QUESTION -> "?"
-
 
             // ========================================================
             // SLASHES
             // ========================================================
 
-            KeyId.SLASH ->
-                if (shift) "?" else "/"
+            KeyId.SLASH -> if (shift) "?" else "/"
 
-            KeyId.BACKSLASH ->
-                if (shift) "|" else "\\"
+            KeyId.BACKSLASH -> if (shift) "|" else "\\"
 
             KeyId.PIPE -> "|"
-
 
             // ========================================================
             // SPACE
             // ========================================================
 
             KeyId.SPACE -> " "
-
 
             // ========================================================
             // UNKNOWN / NON-PRINTABLE

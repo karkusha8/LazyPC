@@ -31,6 +31,7 @@ PACKET_TEXT = 0x50
 PACKET_KEY = 0x51
 PACKET_SHORTCUT = 0x52
 PACKET_LANG_SET = 0x53
+PACKET_MODIFIER = 0x54
 
 
 # ================================================================

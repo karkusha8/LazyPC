@@ -18,6 +18,7 @@ from network.protocol import (
     PACKET_KEY,
     PACKET_SHORTCUT,
     PACKET_LANG_SET,
+    PACKET_MODIFIER,
 )
 
 
@@ -153,6 +154,18 @@ class GestureRouter:
         elif packet_type == PACKET_LANG_SET:
 
             self._handle_language(
+                payload
+            )
+
+
+        # ============================================================
+        # KEYBOARD MODIFIER
+        # ============================================================
+
+
+        elif packet_type == PACKET_MODIFIER:
+
+            self._handle_modifier(
                 payload
             )
 
@@ -422,4 +435,36 @@ class GestureRouter:
 
         self.keyboard.set_language(
             language
+        )
+
+    # ================================================================
+    # MODIFIER
+    # ================================================================
+
+
+    def _handle_modifier(
+        self,
+        payload: bytes
+    ):
+
+        if len(payload) != 2:
+
+            print(
+                "[KEYBOARD] Invalid MODIFIER payload"
+            )
+
+            return
+
+
+        key_id = payload[0]
+        pressed = payload[1] == 1
+
+        print(
+            f"[KEYBOARD] RX MODIFIER -> {key_id} "
+            f"{'DOWN' if pressed else 'UP'}"
+        )
+
+        self.keyboard.modifier(
+            key_id,
+            pressed
         )

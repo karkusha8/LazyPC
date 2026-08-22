@@ -71,6 +71,62 @@ class KeyboardEngine(
 
 
     // ================================================================
+    // DEV MODIFIERS
+    // ================================================================
+
+    private val _ctrlEnabled =
+        MutableStateFlow(false)
+
+    val ctrlEnabled: StateFlow<Boolean> =
+        _ctrlEnabled.asStateFlow()
+
+
+    private val _altEnabled =
+        MutableStateFlow(false)
+
+    val altEnabled: StateFlow<Boolean> =
+        _altEnabled.asStateFlow()
+
+
+    private var lastCtrlTapTime = 0L
+    private var lastAltTapTime = 0L
+
+
+    // ================================================================
+    // RELEASE ACTIVE DEV MODIFIERS
+    // ================================================================
+
+    fun releaseActiveModifiers(): List<KeyAction.Modifier> {
+        val actions = mutableListOf<KeyAction.Modifier>()
+
+        if (_ctrlEnabled.value) {
+            actions += KeyAction.Modifier(
+                com.example.lazypc.input.keyboard.core.KeyId.CTRL,
+                false
+            )
+        }
+
+        if (_altEnabled.value) {
+            actions += KeyAction.Modifier(
+                com.example.lazypc.input.keyboard.core.KeyId.ALT,
+                false
+            )
+        }
+
+        _ctrlEnabled.value = false
+        _altEnabled.value = false
+        lastCtrlTapTime = 0L
+        lastAltTapTime = 0L
+
+        if (actions.isNotEmpty()) {
+            Log.d(TAG, "RELEASE DEV MODIFIERS")
+        }
+
+        return actions
+    }
+
+
+    // ================================================================
     // SET LAYER
     // ================================================================
 
@@ -161,7 +217,7 @@ class KeyboardEngine(
             // TEXT LAYER
             // ========================================================
 
-           com.example.lazypc.input.keyboard.core.KeyId.SWITCH_TEXT -> {
+            com.example.lazypc.input.keyboard.core.KeyId.SWITCH_TEXT -> {
 
                 setLayer(
                     com.example.lazypc.input.keyboard.core.KeyboardLayer.TEXT
@@ -175,7 +231,7 @@ class KeyboardEngine(
             // SYMBOL LAYER
             // ========================================================
 
-          com.example.lazypc.input.keyboard.core.KeyId.SWITCH_CODE -> {
+            com.example.lazypc.input.keyboard.core.KeyId.SWITCH_CODE -> {
 
                 setLayer(
                     com.example.lazypc.input.keyboard.core.KeyboardLayer.CODE
@@ -203,7 +259,7 @@ class KeyboardEngine(
             // SHIFT
             // ========================================================
 
-           com.example.lazypc.input.keyboard.core.KeyId.SHIFT -> {
+            com.example.lazypc.input.keyboard.core.KeyId.SHIFT -> {
 
 
                 val now =
@@ -274,6 +330,72 @@ class KeyboardEngine(
 
 
                 return null
+            }
+
+
+            // ========================================================
+            // CTRL
+            // ========================================================
+
+            com.example.lazypc.input.keyboard.core.KeyId.CTRL -> {
+
+                val now =
+                    SystemClock.elapsedRealtime()
+
+                val isDoubleTap =
+                    now - lastCtrlTapTime < DOUBLE_TAP_TIMEOUT
+
+                lastCtrlTapTime = now
+
+                _ctrlEnabled.value =
+                    if (isDoubleTap) {
+                        !_ctrlEnabled.value
+                    } else {
+                        !_ctrlEnabled.value
+                    }
+
+                Log.d(
+                    TAG,
+                    "CTRL: ${_ctrlEnabled.value}"
+                )
+
+                return KeyAction.Modifier(
+                    com.example.lazypc.input.keyboard.core.KeyId.CTRL,
+                    _ctrlEnabled.value
+                )
+            }
+
+
+            // ========================================================
+            // ALT
+            // ========================================================
+
+            com.example.lazypc.input.keyboard.core.KeyId.ALT -> {
+
+                val now =
+                    SystemClock.elapsedRealtime()
+
+                val isDoubleTap =
+                    now - lastAltTapTime < DOUBLE_TAP_TIMEOUT
+
+                lastAltTapTime = now
+
+                _altEnabled.value =
+                    if (isDoubleTap) {
+                        !_altEnabled.value
+                    } else {
+                        !_altEnabled.value
+                    }
+
+                Log.d(
+                    TAG,
+                    "ALT: ${_altEnabled.value}"
+                )
+
+                return KeyAction.Modifier(
+                    com.example.lazypc.input.keyboard.core.KeyId.ALT,
+                    _altEnabled.value
+                )
             }
 
 

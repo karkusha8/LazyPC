@@ -272,7 +272,10 @@ class ActionResolver {
                 KeyAction.Key(KeyId.ENTER)
 
             KeyId.CTRL ->
-                KeyAction.Key(KeyId.CTRL)
+                KeyAction.Modifier(KeyId.CTRL, true)
+
+            KeyId.ALT ->
+                KeyAction.Modifier(KeyId.ALT, true)
 
 
             // ====================================================
@@ -286,6 +289,9 @@ class ActionResolver {
             // ====================================================
             // FUNCTION KEYS
             // ====================================================
+
+            KeyId.F4 ->
+                KeyAction.Key(KeyId.F4)
 
             KeyId.F5 ->
                 KeyAction.Key(KeyId.F5)
