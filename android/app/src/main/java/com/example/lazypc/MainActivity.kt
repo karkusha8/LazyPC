@@ -97,6 +97,14 @@ class MainActivity : AppCompatActivity() {
     private var videoAreaWidth = 0f
     private var videoAreaHeight = 0f
 
+    // Valid mouse coordinates in fitted-video space.
+    // At 1x these are the whole video; while zoomed they are the
+    // currently visible source rectangle.
+    private var mouseActionMinX = 0f
+    private var mouseActionMaxX = Float.POSITIVE_INFINITY
+    private var mouseActionMinY = 0f
+    private var mouseActionMaxY = Float.POSITIVE_INFINITY
+
     private lateinit var keyboardEngine: KeyboardEngine
     private lateinit var keyboardEmitter: KeyboardEmitter
 
@@ -197,17 +205,34 @@ class MainActivity : AppCompatActivity() {
                 emit = { event ->
                     when (event) {
                         is GestureEvent.Move -> {
-                            mouseEmitter.sendMove(
-                                event.dx,
-                                event.dy
-                            )
+                            val targetX =
+                                (cursorState.x + event.dx).coerceIn(
+                                    mouseActionMinX,
+                                    mouseActionMaxX
+                                )
 
-                            cursorState.move(
-                                dx = event.dx,
-                                dy = event.dy,
-                                width = videoAreaWidth,
-                                height = videoAreaHeight
-                            )
+                            val targetY =
+                                (cursorState.y + event.dy).coerceIn(
+                                    mouseActionMinY,
+                                    mouseActionMaxY
+                                )
+
+                            val actualDx = targetX - cursorState.x
+                            val actualDy = targetY - cursorState.y
+
+                            if (actualDx != 0f || actualDy != 0f) {
+                                mouseEmitter.sendMove(
+                                    actualDx,
+                                    actualDy
+                                )
+
+                                cursorState.move(
+                                    dx = actualDx,
+                                    dy = actualDy,
+                                    width = videoAreaWidth,
+                                    height = videoAreaHeight
+                                )
+                            }
                         }
 
                         GestureEvent.Tap -> {
@@ -227,17 +252,34 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         is GestureEvent.DragMove -> {
-                            mouseEmitter.sendDragMove(
-                                event.dx,
-                                event.dy
-                            )
+                            val targetX =
+                                (cursorState.x + event.dx).coerceIn(
+                                    mouseActionMinX,
+                                    mouseActionMaxX
+                                )
 
-                            cursorState.move(
-                                dx = event.dx,
-                                dy = event.dy,
-                                width = videoAreaWidth,
-                                height = videoAreaHeight
-                            )
+                            val targetY =
+                                (cursorState.y + event.dy).coerceIn(
+                                    mouseActionMinY,
+                                    mouseActionMaxY
+                                )
+
+                            val actualDx = targetX - cursorState.x
+                            val actualDy = targetY - cursorState.y
+
+                            if (actualDx != 0f || actualDy != 0f) {
+                                mouseEmitter.sendDragMove(
+                                    actualDx,
+                                    actualDy
+                                )
+
+                                cursorState.move(
+                                    dx = actualDx,
+                                    dy = actualDy,
+                                    width = videoAreaWidth,
+                                    height = videoAreaHeight
+                                )
+                            }
                         }
 
                         GestureEvent.DragEnd -> {
@@ -305,10 +347,42 @@ class MainActivity : AppCompatActivity() {
                     videoAreaWidth = width
                     videoAreaHeight = height
 
+                    mouseActionMinX = 0f
+                    mouseActionMaxX = width
+                    mouseActionMinY = 0f
+                    mouseActionMaxY = height
+
                     cursorState.initialize(
                         width,
                         height
                     )
+                },
+
+                onRecenterMouse = { targetX, targetY ->
+                    val dx = targetX - cursorState.x
+                    val dy = targetY - cursorState.y
+
+                    if (dx != 0f || dy != 0f) {
+                        mouseEmitter.sendMove(dx, dy)
+
+                        cursorState.move(
+                            dx = dx,
+                            dy = dy,
+                            width = videoAreaWidth,
+                            height = videoAreaHeight
+                        )
+                    }
+                },
+
+                onMouseActionBoundsChanged = {
+                        minX,
+                        maxX,
+                        minY,
+                        maxY ->
+                    mouseActionMinX = minX
+                    mouseActionMaxX = maxX
+                    mouseActionMinY = minY
+                    mouseActionMaxY = maxY
                 },
 
                 keyboardEngine = keyboardEngine,

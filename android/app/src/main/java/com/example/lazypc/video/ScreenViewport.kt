@@ -99,8 +99,15 @@ class ScreenViewport {
             offsetY = 0f
             return
         }
-        val maxOffsetX = max(0f, (width - viewportWidth) / 2f)
-        val maxOffsetY = max(0f, (height - viewportHeight) / 2f)
+        // Pan limits belong to the FIXED VIDEO BOX, not the outer
+        // touch/screen viewport. The outer viewport is used to calculate
+        // the fitted video size, but the transformed content is clipped
+        // by the fitted video Box in RootScreen.
+        val boxWidth = fittedWidth
+        val boxHeight = fittedHeight
+
+        val maxOffsetX = max(0f, (width - boxWidth) / 2f)
+        val maxOffsetY = max(0f, (height - boxHeight) / 2f)
         offsetX = if (offsetX.isFinite()) offsetX.coerceIn(-maxOffsetX, maxOffsetX) else 0f
         offsetY = if (offsetY.isFinite()) offsetY.coerceIn(-maxOffsetY, maxOffsetY) else 0f
     }
