@@ -7,8 +7,10 @@ class ServerConfig:
 
 
 class ScreenConfig:
-    FPS = 7                      # кадров в секунду
-    FRAME_DELAY = 1 / FPS        # автоматический расчёт
+    FPS = 60
+    OUTPUT_COLOR = "RGB"
+    VIDEO_MODE = True
+    FRAME_WAIT_DELAY = 0.001
 
 
 class MouseConfig:

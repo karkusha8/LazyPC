@@ -11,42 +11,97 @@ class ConnectionRegistry:
     def __init__(self) -> None:
         self._session = SessionState()
 
-    async def register(self, role: PeerRole, ws: WebSocket) -> Optional[WebSocket]:
+    async def register(
+        self,
+        role: PeerRole,
+        ws: WebSocket,
+    ) -> Optional[WebSocket]:
+
         async with self._session.lock:
+
             previous: Optional[WebSocket] = None
 
             if role == PeerRole.CLIENT:
                 previous = self._session.client_ws
                 self._session.client_ws = ws
-            elif role == PeerRole.AGENT:
+
+            else:
                 previous = self._session.agent_ws
                 self._session.agent_ws = ws
 
             return previous
 
-    async def unregister(self, role: PeerRole, ws: WebSocket) -> None:
+    async def unregister(
+        self,
+        role: PeerRole,
+        ws: WebSocket,
+    ) -> None:
+
         async with self._session.lock:
-            if role == PeerRole.CLIENT and self._session.client_ws is ws:
+
+            if (
+                role == PeerRole.CLIENT
+                and self._session.client_ws is ws
+            ):
                 self._session.client_ws = None
-            elif role == PeerRole.AGENT and self._session.agent_ws is ws:
+
+            elif (
+                role == PeerRole.AGENT
+                and self._session.agent_ws is ws
+            ):
                 self._session.agent_ws = None
 
-    async def get_peer(self, role: PeerRole) -> Optional[WebSocket]:
-        async with self._session.lock:
-            if role == PeerRole.CLIENT:
-                peer = self._session.agent_ws
-            else:
-                peer = self._session.client_ws
+    async def get_peer(
+        self,
+        role: PeerRole,
+    ) -> Optional[WebSocket]:
 
-            # 🔥 ВАЖНО: проверка жив ли сокет
+        async with self._session.lock:
+
+            peer = (
+                self._session.agent_ws
+                if role == PeerRole.CLIENT
+                else self._session.client_ws
+            )
+
             if peer is None:
                 return None
 
             try:
-                # если сокет закрыт — будет ошибка
                 if peer.client_state.name != "CONNECTED":
                     return None
             except Exception:
                 return None
 
             return peer
+
+    async def notify_client_connected(self) -> None:
+
+        agent = await self.get_peer(PeerRole.CLIENT)
+
+        if agent is None:
+            return
+
+        try:
+            await agent.send_json({
+                "type": "create_session"
+            })
+        except Exception:
+            pass
+
+    async def notify_client_disconnected(self) -> None:
+
+        agent = await self.get_peer(PeerRole.CLIENT)
+
+        if agent is None:
+            return
+
+        try:
+            await agent.send_json({
+                "type": "client_disconnected"
+            })
+        except Exception:
+            pass
+
+
+registry = ConnectionRegistry()

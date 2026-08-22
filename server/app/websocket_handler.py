@@ -1,53 +1,80 @@
 from fastapi import WebSocket, WebSocketDisconnect
 
-clients = {
-    "agent": None,
-    "client": None
-}
-
-last_offer = None
+from app.models import PeerRole
+from app.registry import registry
+from app.relay import safe_close, safe_send_text
 
 
 async def handle_connection(ws: WebSocket):
-    global last_offer
 
     await ws.accept()
 
-    role = (await ws.receive_text()).strip()
-    print("ROLE:", role)
+    hello = (await ws.receive_text()).strip()
 
-    if role not in ["HELLO_AGENT", "HELLO_CLIENT"]:
+    if hello == "HELLO_AGENT":
+        role = PeerRole.AGENT
+
+    elif hello == "HELLO_CLIENT":
+        role = PeerRole.CLIENT
+
+    else:
+        print("❌ Unknown role:", hello)
         await ws.close()
         return
 
-    role = "agent" if role == "HELLO_AGENT" else "client"
-    clients[role] = ws
+    print(f"✅ {role.value} connected")
 
-    print(f"✅ {role} connected")
+    #
+    # Если старая сторона ещё подключена —
+    # отключаем её.
+    #
+    previous = await registry.register(role, ws)
 
-    # 🔥 если клиент подключился — отправляем сохраненный offer
-    if role == "client" and last_offer:
-        print("📨 SEND STORED OFFER TO CLIENT")
-        await ws.send_text(last_offer)
+    if previous is not None:
+        await safe_close(previous)
+
+    #
+    # Новый клиент подключился.
+    # Просим Agent создать новую WebRTC-сессию.
+    #
+    if role == PeerRole.CLIENT:
+
+        print("📱 Client connected -> requesting new session")
+
+        await registry.notify_client_connected()
 
     try:
+
         while True:
+
             msg = await ws.receive_text()
-            print(f"📥 {role}:", msg[:60])
 
-            # 🔥 сохраняем offer
-            if role == "agent" and '"type": "offer"' in msg:
-                last_offer = msg
-                print("💾 OFFER STORED")
+            print(f"📥 {role.value}: {msg[:80]}")
 
-            # отправка другому
-            target = "client" if role == "agent" else "agent"
-            peer = clients.get(target)
+            #
+            # Просто пересылаем сообщение второй стороне.
+            #
+            peer = await registry.get_peer(role)
 
-            if peer:
-                await peer.send_text(msg)
-                print(f"📤 {role} → {target}")
+            if peer is None:
+                continue
+
+            ok = await safe_send_text(peer, msg)
+
+            if ok:
+
+                print(
+                    f"📤 {role.value} -> "
+                    f"{'client' if role == PeerRole.AGENT else 'agent'}"
+                )
 
     except WebSocketDisconnect:
-        print(f"🔌 {role} disconnected")
-        clients[role] = None
+
+        print(f"🔌 {role.value} disconnected")
+
+        if role == PeerRole.CLIENT:
+            await registry.notify_client_disconnected()
+
+    finally:
+
+        await registry.unregister(role, ws)

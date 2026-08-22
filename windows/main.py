@@ -1,27 +1,22 @@
 import asyncio
 
-from agent import Agent
+from connection.connection_manager import ConnectionManager
+
 
 SIGNALING_URL = "ws://127.0.0.1:8000/ws"
 
 
 async def main():
-    agent = Agent(SIGNALING_URL)
 
-    try:
-        await agent.start()
+    manager = ConnectionManager(
+        SIGNALING_URL
+    )
 
-        print("[MAIN] Agent is running. Press Ctrl+C to stop.")
-
-        while True:
-            await asyncio.sleep(1)
-
-    except KeyboardInterrupt:
-        pass
-
-    finally:
-        await agent.stop()
+    await manager.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    asyncio.run(
+        main()
+    )

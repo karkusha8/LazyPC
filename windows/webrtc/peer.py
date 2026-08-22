@@ -1,5 +1,6 @@
 import asyncio
 import struct
+import time
 
 from typing import Callable, Optional
 
@@ -27,26 +28,35 @@ PACKET_CURSOR_POSITION = 0x60
 
 class PeerConnection:
 
-
-    def __init__(
-        self,
-        signaling
-    ):
-
+    def __init__(self, signaling):
 
         self.signaling = signaling
 
+        self.pc: Optional[RTCPeerConnection] = None
+        self.video: Optional[DesktopVideoTrack] = None
+        self.video_sender = None
+        self.channel: Optional[RTCDataChannel] = None
+
+        self.on_text: Optional[Callable[[str], None]] = None
+        self.on_bytes: Optional[Callable[[bytes], None]] = None
+
+        self.cursor_position_provider = None
+        self._cursor_sync_task = None
+
+        self.on_disconnected = None
+
+    async def start_session(self):
+
+        if self.pc is not None:
+            return
+
+        print("[WEBRTC] Creating new session")
 
         self.pc = RTCPeerConnection(
-
             RTCConfiguration(
-
                 iceServers=[
-
                     RTCIceServer(
-
                         urls=[
-
                             "stun:stun.l.google.com:19302"
                         ]
                     )
@@ -54,83 +64,17 @@ class PeerConnection:
             )
         )
 
-
-        # ============================================================
-        # VIDEO TRACK
-        # ============================================================
-
-
         self.video = DesktopVideoTrack()
 
-
-        self.video_sender = (
-
-            self.pc.addTrack(
-                self.video
-            )
+        self.video_sender = self.pc.addTrack(
+            self.video
         )
 
-
-        print(
-            "[WEBRTC] VideoTrack added"
-        )
-
-
-        # ============================================================
-        # FORCE H264
-        # ============================================================
-
+        print("[WEBRTC] VideoTrack added")
 
         self._prefer_h264()
 
-
-        # ============================================================
-        # DATA CHANNEL
-        # ============================================================
-
-
-        self.channel: Optional[
-            RTCDataChannel
-        ] = None
-
-
-        self.on_text: Optional[
-
-            Callable[
-                [str],
-                None
-            ]
-
-        ] = None
-
-
-        self.on_bytes: Optional[
-
-            Callable[
-                [bytes],
-                None
-            ]
-
-        ] = None
-
-
-        # ============================================================
-        # CURSOR SYNC
-        # ============================================================
-
-
-        self.cursor_position_provider = None
-
-
-        self._cursor_sync_task = None
-
-
         self._register_events()
-
-
-    # ================================================================
-    # H264
-    # ================================================================
 
 
     def _prefer_h264(
@@ -253,19 +197,17 @@ class PeerConnection:
         self
     ):
 
-
-        @self.pc.on(
-            "connectionstatechange"
-        )
+        @self.pc.on("connectionstatechange")
         async def _():
 
+            state = self.pc.connectionState
 
-            print(
+            print("[WEBRTC] Connection state:", state)
 
-                "[WEBRTC] Connection state:",
+            if state in ("failed", "disconnected"):
 
-                self.pc.connectionState
-            )
+                if self.on_disconnected is not None:
+                    await self.on_disconnected()
 
 
         @self.pc.on(
@@ -612,96 +554,43 @@ class PeerConnection:
     # CREATE OFFER
     # ================================================================
 
+    async def create_offer(self):
 
-    async def create_offer(
-        self
-    ):
-
+        if self.pc is None:
+            await self.start_session()
 
         if self.channel is None:
-
-
-            self.channel = (
-
-                self.pc.createDataChannel(
-
-                    "control"
-                )
+            self.channel = self.pc.createDataChannel(
+                "control"
             )
 
-
             self._bind_channel(
-
                 self.channel
             )
 
+        print("[WEBRTC] Creating offer")
 
-        print(
-            "[WEBRTC] Creating offer"
-        )
-
-
-        offer = (
-
-            await self.pc.createOffer()
-        )
-
+        offer = await self.pc.createOffer()
 
         await self.pc.setLocalDescription(
-
             offer
         )
 
+        print("=" * 80)
+        print("LOCAL OFFER SDP")
+        print("=" * 80)
+        print(self.pc.localDescription.sdp)
+        print("=" * 80)
 
-        print(
-            "=" * 80
-        )
+        if "H264" in self.pc.localDescription.sdp:
 
-        print(
-            "LOCAL OFFER SDP"
-        )
-
-        print(
-            "=" * 80
-        )
-
-        print(
-            self.pc.localDescription.sdp
-        )
-
-        print(
-            "=" * 80
-        )
-
-
-        if (
-
-            "H264"
-
-            in
-
-            self.pc.localDescription.sdp
-
-        ):
-
-
-            print(
-
-                "[WEBRTC] H264 present in Offer SDP"
-            )
-
+            print("[WEBRTC] H264 present in Offer SDP")
 
         else:
 
-
-            print(
-
-                "[WEBRTC] WARNING: H264 NOT FOUND IN OFFER SDP"
-            )
-
+            print("[WEBRTC] WARNING: H264 NOT FOUND IN OFFER SDP")
 
         await self.signaling.send_offer(
-
             self.pc.localDescription.sdp
         )
 
@@ -842,32 +731,38 @@ class PeerConnection:
             message["type"]
         )
 
+        if message_type == "create_session":
 
-        if message_type == "offer":
+            print("[SIGNALING] Create session requested")
 
+            await self.create_offer()
+
+        elif message_type == "offer":
 
             await self.receive_offer(
-
                 message["sdp"]
             )
-
 
         elif message_type == "answer":
 
-
             await self.receive_answer(
-
                 message["sdp"]
             )
 
-
         elif message_type == "candidate":
 
-
             print(
-
                 "[ICE] Candidate received"
             )
+
+
+
+        elif message_type == "client_disconnected":
+
+            print("[SIGNALING] Client disconnected")
+
+            if self.on_disconnected is not None:
+                await self.on_disconnected()
 
 
     # ================================================================
@@ -927,6 +822,58 @@ class PeerConnection:
                 data
             )
 
+    async def stop_session(self):
+
+        if self.pc is None:
+            return
+
+        print("[WEBRTC] Stopping session")
+
+        if self._cursor_sync_task is not None:
+
+            if not self._cursor_sync_task.done():
+
+                self._cursor_sync_task.cancel()
+
+                try:
+                    await self._cursor_sync_task
+                except asyncio.CancelledError:
+                    pass
+
+            self._cursor_sync_task = None
+
+        try:
+
+            if self.video is not None:
+                self.video.stop()
+
+        except Exception as e:
+
+            print("[VIDEO] Stop error:", e)
+
+        try:
+
+            if self.channel is not None:
+                self.channel.close()
+
+        except Exception:
+            pass
+
+        try:
+            print("[DEBUG] before pc.close")
+            await self.pc.close()
+            print("[DEBUG] after pc.close")
+        except Exception:
+            print("[DEBUG] pc.close exception:", e)
+            pass
+        print("[DEBUG] before destroy")
+
+        self.pc = None
+        self.video = None
+        self.video_sender = None
+        self.channel = None
+
+        print("[WEBRTC] Session destroyed")
 
     # ================================================================
     # CLOSE
@@ -942,7 +889,7 @@ class PeerConnection:
 
             "[WEBRTC] Closing PeerConnection"
         )
-
+        total = time.perf_counter()
 
         # ========================================================
         # STOP CURSOR SYNC
@@ -960,8 +907,9 @@ class PeerConnection:
 
                 try:
 
-
+                    t = time.perf_counter()
                     await self._cursor_sync_task
+                    print(f"[TIME] cursor stop: {time.perf_counter() - t:.3f}s")
 
 
                 except asyncio.CancelledError:
@@ -980,8 +928,9 @@ class PeerConnection:
 
         try:
 
-
-            await self.video.stop()
+            t = time.perf_counter()
+            self.video.stop()
+            print(f"[TIME] video.stop(): {time.perf_counter() - t:.3f}s")
 
 
         except Exception as e:
@@ -1001,20 +950,21 @@ class PeerConnection:
 
 
         if self.channel:
-
-
+            t = time.perf_counter()
             self.channel.close()
+            print(f"[TIME] channel.close(): {time.perf_counter() - t:.3f}s")
 
 
         # ========================================================
         # CLOSE PEER CONNECTION
         # ========================================================
 
+        print("[DEBUG] before pc.close")
+
+        t = time.perf_counter()
 
         await self.pc.close()
 
+        print("[DEBUG] after pc.close")
 
-        print(
-
-            "[WEBRTC] PeerConnection closed"
-        )
+        print(f"[TIME] pc.close(): {time.perf_counter() - t:.3f}s")

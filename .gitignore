@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# JetBrains IDE
+.idea/
+*.iml
+
+# Android / Gradle
+.gradle/
+**/build/
+local.properties
+
+# OS
+.DS_Store
+Thumbs.db
