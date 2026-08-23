@@ -776,6 +776,33 @@ tests = ["check-manifest", "coverage (>=7.4.2)", "defusedxml", "markdown2", "ole
 xmp = ["defusedxml"]
 
 [[package]]
+name = "pyaudiowpatch"
+version = "0.2.12.8"
+description = "PortAudio fork with WASAPI loopback support"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "pyaudiowpatch-0.2.12.8-cp310-cp310-win32.whl", hash = "sha256:c5bffe533fdf37f36f58d8997f90247d46d42db2b1c4a970d9cc4637dacd322c"},
+    {file = "pyaudiowpatch-0.2.12.8-cp310-cp310-win_amd64.whl", hash = "sha256:7a2059464378213c0b83cdbea04a0ceacbdbd5ec791ffe29ed2ce490321aa604"},
+    {file = "pyaudiowpatch-0.2.12.8-cp311-cp311-win32.whl", hash = "sha256:13903f6a78abfd745fbae82c1edda95119fce179c6f2fc95e7849a54d537dce1"},
+    {file = "pyaudiowpatch-0.2.12.8-cp311-cp311-win_amd64.whl", hash = "sha256:8610948499efa12b01ec861408fcc95e7bc18c1dddf0abbfed6fd2305a898f63"},
+    {file = "pyaudiowpatch-0.2.12.8-cp312-cp312-win32.whl", hash = "sha256:5c6f54cbee50ed3c971767cc8e85f45e94012aa3c4363b7cdd8541e9f9496d01"},
+    {file = "pyaudiowpatch-0.2.12.8-cp312-cp312-win_amd64.whl", hash = "sha256:fd163a6531c4e4969925e687ef1bc57fae8ecc1a95de7ba707a436622552d7fa"},
+    {file = "pyaudiowpatch-0.2.12.8-cp313-cp313-win32.whl", hash = "sha256:d941c272ced5b1c6f1d054d47046ef50efcee954151c293c0102b410f549c3ab"},
+    {file = "pyaudiowpatch-0.2.12.8-cp313-cp313-win_amd64.whl", hash = "sha256:3339e6430836a021e1a83ddb915a42eec0a8f198693855a8f32a57b4b97e0202"},
+    {file = "pyaudiowpatch-0.2.12.8-cp314-cp314-win32.whl", hash = "sha256:448b83316295ab4786b1844ea296d4848c75b93ada4df6f2150715520cf985a5"},
+    {file = "pyaudiowpatch-0.2.12.8-cp314-cp314-win_amd64.whl", hash = "sha256:df6e26032439d87cbbeb8f433e635652a36d54cdd14aa058188e21ba5c9a7df9"},
+    {file = "pyaudiowpatch-0.2.12.8-cp38-cp38-win32.whl", hash = "sha256:82617f01581a563ffab228bdf6b31a72949ce7673bf7d2716294da142012b645"},
+    {file = "pyaudiowpatch-0.2.12.8-cp38-cp38-win_amd64.whl", hash = "sha256:0de232f72302c4a37162ab0c56f55616631b0490f213f7dbe651ba589d7d77a0"},
+    {file = "pyaudiowpatch-0.2.12.8-cp39-cp39-win32.whl", hash = "sha256:f9f7b48b3baa088e2bc1f8e4d465ce5341b62fcd7a57023427ff1d8f7b4c1269"},
+    {file = "pyaudiowpatch-0.2.12.8-cp39-cp39-win_amd64.whl", hash = "sha256:19dd0727ac54c5fc2062d3073a985099348fe8c57b7f284007c50b02f8601e57"},
+]
+
+[package.extras]
+test = ["numpy"]
+
+[[package]]
 name = "pyautogui"
 version = "0.9.54"
 description = "PyAutoGUI lets Python control the mouse and keyboard, and other GUI automation tasks. For Windows, macOS, and Linux, on Python 3 and 2."
@@ -1290,6 +1317,28 @@ files = [
 ]
 
 [[package]]
+name = "sounddevice"
+version = "0.5.6"
+description = "Play and Record Sound with Python"
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+files = [
+    {file = "sounddevice-0.5.6-py3-none-any.whl", hash = "sha256:de099612311ad81e55d31ccbd83f43ea6bf4d87b48f9b6ea55a1fbcde0eee4e0"},
+    {file = "sounddevice-0.5.6-py3-none-macosx_10_6_x86_64.macosx_10_6_universal2.whl", hash = "sha256:e3aef00ad8b1d1740eb66d9a7671eab88a4d2b8fa4ab33498d742e63b65c309c"},
+    {file = "sounddevice-0.5.6-py3-none-win32.whl", hash = "sha256:b36b807eb02abd257198bf84b2af05e4fea199a9d2f0019014169c7136d45e9c"},
+    {file = "sounddevice-0.5.6-py3-none-win_amd64.whl", hash = "sha256:7f4162f514f007b0bf25a3ccfed3f1705bc2ec311888a90232729eec4f57a4f4"},
+    {file = "sounddevice-0.5.6-py3-none-win_arm64.whl", hash = "sha256:c8ae19173e5f27f8c12d4b5eee2dbfe542cee125d591e663e0fb4dfb75246d45"},
+    {file = "sounddevice-0.5.6.tar.gz", hash = "sha256:8ec9fbfde2e32f020b167e348f3ab3bac6625a5f15af524d790108ac7147a410"},
+]
+
+[package.dependencies]
+cffi = "*"
+
+[package.extras]
+numpy = ["numpy"]
+
+[[package]]
 name = "starlette"
 version = "0.50.0"
 description = "The little ASGI library that shines."
@@ -1639,4 +1688,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12"
-content-hash = "3cc75532092031430a29f2ae1e727761e549d87d8752caf43537bec90b8f8d65"
+content-hash = "67713cf01365da6b52fcc9c70a31c84440bd5fa4c384a9332f027ed906526ccd"

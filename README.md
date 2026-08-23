@@ -109,11 +109,11 @@ Mouse movement is also restricted to the currently visible part of the remote de
 - [x] Custom virtual keyboard
 - [x] Keyboard input
 - [x] Basic keyboard shortcuts
+- [x] Audio streaming
 
 ### Planned
 
 - [ ] Clipboard synchronization
-- [ ] Audio streaming
 - [ ] Connection status indicator
 - [ ] Performance statistics
 - [ ] FPS monitoring

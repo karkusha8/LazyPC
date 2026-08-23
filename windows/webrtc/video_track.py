@@ -41,6 +41,12 @@ class DesktopVideoTrack(VideoStreamTrack):
         self._timestamp = 0
         self._next_frame_time: float | None = None
 
+        # Diagnostics only. These measure the capture/pacing side before
+        # H264 encoding and RTP packetization.
+        self._diag_frames = 0
+        self._diag_slow_camera_ms = 0.0
+        self._diag_slow_recv_ms = 0.0
+
         # Create DXCam.
         self.camera = dxcam.create(
             output_color=ScreenConfig.OUTPUT_COLOR
@@ -101,6 +107,7 @@ class DesktopVideoTrack(VideoStreamTrack):
                 "DesktopVideoTrack is stopped"
             )
 
+        recv_started = time.perf_counter()
         image = None
 
         # DXCam can return None immediately after startup.
@@ -110,7 +117,18 @@ class DesktopVideoTrack(VideoStreamTrack):
                     "DesktopVideoTrack is stopped"
                 )
 
+            camera_started = time.perf_counter()
             image = self.camera.get_latest_frame()
+            camera_ms = (time.perf_counter() - camera_started) * 1000.0
+
+            if camera_ms > self._diag_slow_camera_ms:
+                self._diag_slow_camera_ms = camera_ms
+
+            if camera_ms > 10.0:
+                print(
+                    "[VIDEO][CAPTURE][SLOW] "
+                    f"get_latest_frame={camera_ms:.2f}ms"
+                )
 
             if image is None:
                 await asyncio.sleep(
@@ -122,6 +140,29 @@ class DesktopVideoTrack(VideoStreamTrack):
             image,
             format="rgb24",
         )
+
+        total_recv_ms = (time.perf_counter() - recv_started) * 1000.0
+        self._diag_frames += 1
+
+        if total_recv_ms > self._diag_slow_recv_ms:
+            self._diag_slow_recv_ms = total_recv_ms
+
+        if total_recv_ms > 25.0:
+            print(
+                "[VIDEO][TRACK][SLOW] "
+                f"recv={total_recv_ms:.2f}ms "
+                f"capture={camera_ms:.2f}ms"
+            )
+
+        if self._diag_frames % 60 == 0:
+            print(
+                "[VIDEO][TRACK] "
+                f"frames={self._diag_frames} "
+                f"recv={total_recv_ms:.2f}ms "
+                f"capture={camera_ms:.2f}ms "
+                f"max_capture={self._diag_slow_camera_ms:.2f}ms "
+                f"max_recv={self._diag_slow_recv_ms:.2f}ms"
+            )
 
         # 90 kHz WebRTC video timestamp.
         frame.pts = self._timestamp
@@ -145,15 +186,51 @@ class DesktopVideoTrack(VideoStreamTrack):
 
     def stop(self) -> None:
         if self._stopped:
+            print("[VIDEO] DXCam already stopped")
             return
 
         self._stopped = True
 
-        try:
-            self.camera.stop()
-        except Exception as e:
-            print(
-                f"[VIDEO] DXCam stop error: {e}"
-            )
+        camera = self.camera
 
-        print("[VIDEO] DXCam stopped")
+        # Сначала убираем ссылку с track.
+        # Это важно: после этого track больше не сможет использовать камеру.
+        self.camera = None
+
+        if camera is None:
+            print("[VIDEO] DXCam object already released")
+            return
+
+        print("[VIDEO] DXCam stop: begin")
+
+        # ------------------------------------------------------------
+        # 1. Останавливаем capture thread
+        # ------------------------------------------------------------
+        try:
+            if camera.is_capturing:
+                camera.stop()
+                print("[VIDEO] DXCam capture stopped")
+            else:
+                print("[VIDEO] DXCam capture was already stopped")
+        except Exception as e:
+            print(f"[VIDEO] DXCam stop error: {e}")
+
+        # ------------------------------------------------------------
+        # 2. Полностью освобождаем DXCam
+        # ------------------------------------------------------------
+        try:
+            if not camera.is_released:
+                print("[VIDEO] DXCam release: begin")
+                camera.release()
+                print("[VIDEO] DXCam release: done")
+            else:
+                print("[VIDEO] DXCam already released")
+        except Exception as e:
+            print(f"[VIDEO] DXCam release error: {e}")
+
+        # ------------------------------------------------------------
+        # 3. Уничтожаем последнюю Python-ссылку
+        # ------------------------------------------------------------
+        del camera
+
+        print("[VIDEO] DXCam stopped and released")

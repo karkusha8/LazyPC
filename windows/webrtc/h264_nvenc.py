@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fractions
+import time
 from typing import Iterator
 
 import av
@@ -54,15 +55,52 @@ class H264NVENCEncoder(_AiortcH264Encoder):
 
             print("[LazyPC][NVENC] encoder created")
 
+        encode_started = time.perf_counter()
+        packet_bytes = 0
+        packet_count = 0
+        nal_count = 0
+
         try:
             for packet in self.codec.encode(frame):
+                packet_count += 1
                 data = bytes(packet)
+                packet_bytes += len(data)
                 if not data:
                     continue
 
                 for nal in self._split_annex_b(data):
                     if nal:
+                        nal_count += 1
                         yield nal
+
+            encode_ms = (time.perf_counter() - encode_started) * 1000.0
+
+            count = getattr(self, "_diag_encode_frames", 0) + 1
+            self._diag_encode_frames = count
+
+            max_ms = max(
+                encode_ms,
+                getattr(self, "_diag_encode_max_ms", 0.0),
+            )
+            self._diag_encode_max_ms = max_ms
+
+            if encode_ms > 20.0:
+                print(
+                    "[VIDEO][ENCODE][SLOW] "
+                    f"frame={count} encode={encode_ms:.2f}ms "
+                    f"packet_bytes={packet_bytes} "
+                    f"packets={packet_count} nals={nal_count}"
+                )
+
+            if count % 60 == 0:
+                print(
+                    "[VIDEO][ENCODE] "
+                    f"frames={count} "
+                    f"last={encode_ms:.2f}ms "
+                    f"max={max_ms:.2f}ms "
+                    f"packet_bytes={packet_bytes} "
+                    f"nals={nal_count}"
+                )
 
         except Exception as exc:
             print(

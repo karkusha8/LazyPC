@@ -7,6 +7,7 @@ from aiortc.codecs import get_encoder as _original_get_encoder
 
 from webrtc.h264_cpu import H264CPUEncoder
 from webrtc.h264_nvenc import H264NVENCEncoder
+from webrtc.opus_audio import OpusAudioEncoder
 
 
 def _try_nvenc() -> bool:
@@ -48,22 +49,37 @@ _NVENC_AVAILABLE = _try_nvenc()
 
 def get_encoder(codec: Any):
     """
-    aiortc encoder factory.
+    LazyPC aiortc encoder factory.
 
     H264:
-      NVENC available -> H264NVENCEncoder
-      otherwise       -> H264CPUEncoder
+        NVENC -> GPU
+        CPU   -> fallback
 
-    Other codecs are delegated to aiortc unchanged.
+    Opus:
+        LazyPC custom audio encoder
+
+    Everything else:
+        aiortc default encoder
     """
+
     mime_type = getattr(codec, "mimeType", "").lower()
 
     if mime_type == "video/h264":
         if _NVENC_AVAILABLE:
-            print("[LazyPC] get_encoder -> NVENC H264Encoder")
+            print(
+                "[LazyPC] get_encoder -> NVENC H264Encoder"
+            )
             return H264NVENCEncoder()
 
-        print("[LazyPC] get_encoder -> CPU H264Encoder")
+        print(
+            "[LazyPC] get_encoder -> CPU H264Encoder"
+        )
         return H264CPUEncoder()
+
+    if mime_type == "audio/opus":
+        print(
+            "[LazyPC] get_encoder -> LazyPC OpusAudioEncoder"
+        )
+        return OpusAudioEncoder()
 
     return _original_get_encoder(codec)
