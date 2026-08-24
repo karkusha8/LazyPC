@@ -1,15 +1,23 @@
 package com.example.lazypc
 
 import android.os.Bundle
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
 import android.util.Log
+import android.os.Handler
+import android.os.Looper
+import android.content.Intent
 import androidx.activity.compose.setContent
 import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.content.ContextCompat
 import com.example.lazypc.input.mouse.CursorState
 import com.example.lazypc.input.mouse.MouseEmitter
 import com.example.lazypc.input.PointerInputRouter
@@ -19,13 +27,9 @@ import com.example.lazypc.input.keyboard.core.ActionResolver
 import com.example.lazypc.input.keyboard.core.KeyboardEngine
 import com.example.lazypc.input.keyboard.emit.KeyboardEmitter
 import com.example.lazypc.input.keyboard.mapping.LanguageEN
-import com.example.lazypc.network.WsClient
 import com.example.lazypc.ui.screens.RootScreen
 import com.example.lazypc.video.CustomVideoRenderer
-import com.example.lazypc.webrtc.WebRTCClient
-import org.json.JSONObject
-import org.webrtc.EglBase
-import org.webrtc.IceCandidate
+import com.example.lazypc.service.WebRTCForegroundService
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
@@ -41,11 +45,10 @@ class MainActivity : AppCompatActivity() {
             "ws://192.168.0.148:8000/ws"
     }
 
-    private lateinit var ws: WsClient
-    private lateinit var webrtc: WebRTCClient
+    private var webRtcService: WebRTCForegroundService? = null
+    private var serviceBound = false
 
     private lateinit var renderer: CustomVideoRenderer
-    private lateinit var eglBase: EglBase
 
     private var currentVideoTrack: VideoTrack? = null
 
@@ -110,6 +113,37 @@ class MainActivity : AppCompatActivity() {
 
     private var dragModeEnabled = false
 
+    private var sessionConnecting by mutableStateOf(false)
+    private var sessionConnected by mutableStateOf(false)
+
+    private val lifecycleHandler = Handler(Looper.getMainLooper())
+    private var recoveryScheduled = false
+    private var recoveryInProgress = false
+    private var finishing = false
+    private var sessionStarted = false
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(
+            name: ComponentName?,
+            service: IBinder?
+        ) {
+            val binder = service as? WebRTCForegroundService.LocalBinder
+                ?: return
+
+            webRtcService = binder.service()
+            serviceBound = true
+
+            Log.d(TAG_APP, "🟢 WEBRTC SERVICE BOUND")
+            initializeFromService()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            serviceBound = false
+            webRtcService = null
+            Log.w(TAG_APP, "🔴 WEBRTC SERVICE DISCONNECTED")
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -130,69 +164,26 @@ class MainActivity : AppCompatActivity() {
 
         Log.d(TAG_APP, "🚀 LAZYPC START")
 
-        eglBase = EglBase.create()
+        val serviceIntent =
+            Intent(this, WebRTCForegroundService::class.java)
 
-        webrtc = WebRTCClient(
-            context = this,
-            eglContext = eglBase.eglBaseContext,
-
-            onFrame = { track ->
-                runOnUiThread {
-                    if (currentVideoTrack === track) {
-                        return@runOnUiThread
-                    }
-
-                    if (::renderer.isInitialized) {
-                        currentVideoTrack
-                            ?.removeSink(renderer)
-                    }
-
-                    currentVideoTrack
-                        ?.removeSink(videoSizeSink)
-
-                    currentVideoTrack = track
-                    track.addSink(videoSizeSink)
-
-                    if (!::renderer.isInitialized) {
-                        return@runOnUiThread
-                    }
-
-                    track.addSink(renderer)
-                }
-            },
-
-            onIce = { candidate ->
-                if (!::ws.isInitialized) {
-                    return@WebRTCClient
-                }
-
-                val json = JSONObject().apply {
-                    put("type", "candidate")
-                    put("candidate", candidate.sdp)
-                    put("sdpMid", candidate.sdpMid)
-                    put("sdpMLineIndex", candidate.sdpMLineIndex)
-                }
-
-                ws.sendText(json.toString())
-            },
-
-            onCursorPosition = {
-                    normalizedX,
-                    normalizedY ->
-
-                runOnUiThread {
-                    cursorState.setNormalizedPosition(
-                        normalizedX = normalizedX,
-                        normalizedY = normalizedY,
-                        width = videoAreaWidth,
-                        height = videoAreaHeight
-                    )
-                }
-            }
+        ContextCompat.startForegroundService(
+            this,
+            serviceIntent
         )
 
-        webrtc.init()
-        webrtc.createPeerConnection()
+        bindService(
+            serviceIntent,
+            serviceConnection,
+            BIND_AUTO_CREATE
+        )
+    }
+
+    private fun initializeFromService() {
+        val service = webRtcService ?: return
+
+        val eglContext = service.eglContext()
+        val webrtc = service.webRtcClient()
 
         mouseEmitter = MouseEmitter(webrtc)
 
@@ -308,7 +299,7 @@ class MainActivity : AppCompatActivity() {
 
         setContent {
             RootScreen(
-                eglContext = eglBase.eglBaseContext,
+                eglContext = eglContext,
 
                 videoWidth = detectedVideoWidth,
                 videoHeight = detectedVideoHeight,
@@ -395,62 +386,80 @@ class MainActivity : AppCompatActivity() {
                         TAG_INPUT,
                         "🧲 Drag mode = $enabled"
                     )
+                },
+
+                sessionConnecting = sessionConnecting,
+                sessionConnected = sessionConnected,
+
+                onConnectSession = {
+                    webRtcService?.connectSession()
+                },
+
+                onDisconnectSession = {
+                    webRtcService?.disconnectSession()
                 }
             )
         }
 
-        ws = WsClient(SIGNALING_URL)
-
-        ws.setOnTextMessage { text ->
-            if (!text.startsWith("{")) {
-                return@setOnTextMessage
-            }
-
-            try {
-                val json = JSONObject(text)
-
-                when (json.optString("type")) {
-                    "offer" -> {
-                        val sdp = json.optString("sdp")
-
-                        if (sdp.isEmpty()) {
-                            return@setOnTextMessage
-                        }
-
-                        webrtc.setRemoteOffer(sdp) { answer ->
-                            ws.sendAnswer(answer)
-                        }
+        service.registerUiCallbacks(
+            onVideoTrackChanged = { track ->
+                runOnUiThread {
+                    if (currentVideoTrack === track) {
+                        return@runOnUiThread
                     }
 
-                    "candidate" -> {
-                        val candidateSdp =
-                            json.optString("candidate")
+                    if (::renderer.isInitialized) {
+                        currentVideoTrack
+                            ?.removeSink(renderer)
+                    }
 
-                        if (candidateSdp.isEmpty()) {
-                            return@setOnTextMessage
-                        }
+                    currentVideoTrack
+                        ?.removeSink(videoSizeSink)
 
-                        val candidate =
-                            IceCandidate(
-                                json.optString("sdpMid"),
-                                json.optInt("sdpMLineIndex"),
-                                candidateSdp
-                            )
+                    currentVideoTrack = track
 
-                        webrtc.addRemoteCandidate(candidate)
+                    track?.addSink(videoSizeSink)
+
+                    if (::renderer.isInitialized) {
+                        track?.addSink(renderer)
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG_WS, "SIGNALING ERROR", e)
-            }
-        }
+            },
 
-        ws.connect()
+            onCursorPosition = { normalizedX, normalizedY ->
+                runOnUiThread {
+                    cursorState.setNormalizedPosition(
+                        normalizedX = normalizedX,
+                        normalizedY = normalizedY,
+                        width = videoAreaWidth,
+                        height = videoAreaHeight
+                    )
+                }
+            },
+
+            onSignalingState = { connected ->
+                Log.d(
+                    TAG_WS,
+                    if (connected) {
+                        "🟢 SIGNALING CONNECTED [SERVICE]"
+                    } else {
+                        "🔴 SIGNALING DISCONNECTED [SERVICE]"
+                    }
+                )
+            },
+
+            onSessionState = { connecting, connected ->
+                sessionConnecting = connecting
+                sessionConnected = connected
+            }
+        )
     }
 
     override fun onPause() {
         super.onPause()
         Log.d(TAG_APP, "⏸ APP PAUSED")
+        // Do not close WebRTC or force a signaling reconnect here.
+        // If the OS/network keeps the transport alive, onResume will reuse it.
     }
 
     override fun onResume() {
@@ -465,6 +474,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        finishing = true
+        lifecycleHandler.removeCallbacksAndMessages(null)
+
+        if (serviceBound) {
+            webRtcService?.unregisterUiCallbacks()
+            unbindService(serviceConnection)
+            serviceBound = false
+        }
+
         if (::renderer.isInitialized) {
             currentVideoTrack?.removeSink(renderer)
             renderer.releaseRenderer()
@@ -473,9 +491,9 @@ class MainActivity : AppCompatActivity() {
         currentVideoTrack?.removeSink(videoSizeSink)
         currentVideoTrack = null
 
-        if (::eglBase.isInitialized) {
-            eglBase.release()
-        }
+        // Do NOT close WebRTC, signaling, or the foreground service here.
+        // Those objects belong to the service and must survive Activity
+        // recreation/backgrounding.
 
         super.onDestroy()
     }

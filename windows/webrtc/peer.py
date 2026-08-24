@@ -55,94 +55,11 @@ class PeerConnection:
 
         self.cursor_position_provider = None
         self._cursor_sync_task = None
-        self._stats_task = None
 
         self.on_disconnected = None
         self._stopping = False
-        self._stats_task = None
-
-        # Video pipeline diagnostics. Counts frames returned by DesktopVideoTrack
-        # before aiortc encoding/packetization.
-        self._video_track_frames = 0
-        self._video_track_bytes = 0
-        self._video_track_last_pts = None
-        self._video_track_last_t = None
-        self._video_track_max_gap_ms = 0.0
-        self._video_track_last_log = time.monotonic()
-
-        # ================================================================
-        # SESSION-WIDE DIAGNOSTIC ACCUMULATORS
-        # ================================================================
-        # These are real running statistics, not (min + max) / 2.
-        # We print min / max / arithmetic mean when the session stops.
-        self._diag_session_started = time.monotonic()
-        self._diag_rtt = {}
-        self._diag_loop_delay = []
-
-    @staticmethod
-    def _diag_add_sample(store, key, value_ms):
-        if value_ms is None:
-            return
-        try:
-            value_ms = float(value_ms)
-        except (TypeError, ValueError):
-            return
-        if value_ms < 0:
-            return
-        item = store.setdefault(
-            key,
-            {"count": 0, "sum": 0.0, "min": float("inf"), "max": 0.0},
-        )
-        item["count"] += 1
-        item["sum"] += value_ms
-        item["min"] = min(item["min"], value_ms)
-        item["max"] = max(item["max"], value_ms)
-
-    def _print_diagnostic_summary(self):
-        duration = max(
-            time.monotonic() - self._diag_session_started,
-            0.0,
-        )
-
-        print("=")
-        print("=" * 80)
-        print("[DIAG][SUMMARY] SESSION DIAGNOSTICS")
-        print("=" * 80)
-        print(f"[DIAG][SUMMARY] duration={duration:.1f}s")
-
-        if self._diag_rtt:
-            print("[DIAG][SUMMARY] RTT statistics (real arithmetic mean):")
-            for key, item in self._diag_rtt.items():
-                if item["count"] <= 0:
-                    continue
-                avg = item["sum"] / item["count"]
-                print(
-                    f"[DIAG][RTT] {key}: "
-                    f"min={item['min']:.1f}ms "
-                    f"avg={avg:.1f}ms "
-                    f"max={item['max']:.1f}ms "
-                    f"samples={item['count']}"
-                )
-        else:
-            print("[DIAG][RTT] no RTT samples collected")
-
-        if self._diag_loop_delay:
-            avg_loop = sum(self._diag_loop_delay) / len(self._diag_loop_delay)
-            print(
-                "[DIAG][LOOP] "
-                f"min={min(self._diag_loop_delay):.1f}ms "
-                f"avg={avg_loop:.1f}ms "
-                f"max={max(self._diag_loop_delay):.1f}ms "
-                f"samples={len(self._diag_loop_delay)}"
-            )
-        else:
-            print("[DIAG][LOOP] no loop-delay samples collected")
-
-        print("=" * 80)
-        print("[DIAG][SUMMARY] END")
-        print("=" * 80)
-        print("=")
-
+        self._disconnect_task = None
+        self.on_session_close = None
     async def start_session(self):
 
         if self.pc is not None:
@@ -164,27 +81,6 @@ class PeerConnection:
 
         self.video = DesktopVideoTrack()
 
-        # Wrap recv() only for diagnostics; the underlying DesktopVideoTrack
-        # and its capture/encoder implementation remain untouched.
-        original_video_recv = self.video.recv
-
-        async def _diagnostic_video_recv():
-            started = time.monotonic()
-            frame = await original_video_recv()
-            now = time.monotonic()
-            self._video_track_frames += 1
-            self._video_track_last_t = now
-            try:
-                self._video_track_bytes += int(frame.width * frame.height * 3 // 2)
-            except Exception:
-                pass
-            gap_ms = (now - started) * 1000.0
-            if gap_ms > self._video_track_max_gap_ms:
-                self._video_track_max_gap_ms = gap_ms
-            return frame
-
-        self.video.recv = _diagnostic_video_recv
-
         self.video_sender = self.pc.addTrack(
             self.video
         )
@@ -200,10 +96,6 @@ class PeerConnection:
         self._prefer_h264()
 
         self._register_events()
-
-        self._stats_task = asyncio.create_task(
-            self._webrtc_diagnostics_loop()
-        )
 
 
     def _prefer_h264(
@@ -320,239 +212,6 @@ class PeerConnection:
     # ================================================================
     # EVENTS
     # ================================================================
-
-
-    async def _webrtc_diagnostics_loop(self):
-        """Periodic WebRTC diagnostics plus session-wide RTT statistics."""
-        last_t = time.monotonic()
-        last_bytes = {}
-        last_packets = {}
-        last_log = time.monotonic()
-
-        try:
-            while self.pc is not None and not self._stopping:
-                await asyncio.sleep(0.5)
-
-                now = time.monotonic()
-                loop_delay_ms = (now - last_t - 0.5) * 1000.0
-                last_t = now
-
-                # Keep all samples so the final average is a real arithmetic
-                # mean across the whole session.
-                self._diag_loop_delay.append(loop_delay_ms)
-
-                if loop_delay_ms > 100.0:
-                    print(
-                        f"[WEBRTC][STALL] asyncio loop delayed "
-                        f"{loop_delay_ms:.1f}ms"
-                    )
-
-                try:
-                    stats = await self.pc.getStats()
-                except Exception as exc:
-                    print(f"[WEBRTC][STATS] getStats error: {exc}")
-                    continue
-
-                if now - last_log < 1.0:
-                    continue
-                last_log = now
-
-                lines = []
-
-                for report in stats.values():
-                    typ = getattr(report, "type", "")
-
-                    if (
-                        typ == "candidate-pair"
-                        and getattr(report, "state", None) == "succeeded"
-                    ):
-                        rtt = getattr(
-                            report,
-                            "currentRoundTripTime",
-                            None,
-                        )
-                        out = getattr(
-                            report,
-                            "availableOutgoingBitrate",
-                            None,
-                        )
-                        inc = getattr(
-                            report,
-                            "availableIncomingBitrate",
-                            None,
-                        )
-
-                        if rtt is not None:
-                            rtt_ms = rtt * 1000.0
-                            self._diag_add_sample(
-                                self._diag_rtt,
-                                "ICE/candidate-pair",
-                                rtt_ms,
-                            )
-                            lines.append(
-                                f"PAIR rtt={rtt_ms:.1f}ms "
-                            )
-                        else:
-                            lines.append("PAIR ")
-
-                        if out is not None:
-                            lines[-1] += (
-                                f"avail_out={out / 1e6:.2f}Mbps "
-                            )
-                        if inc is not None:
-                            lines[-1] += (
-                                f"avail_in={inc / 1e6:.2f}Mbps"
-                            )
-
-                    elif typ == "outbound-rtp":
-                        kind = getattr(
-                            report,
-                            "kind",
-                            getattr(report, "mediaType", "?"),
-                        )
-                        sid = getattr(
-                            report,
-                            "ssrc",
-                            id(report),
-                        )
-                        b = getattr(
-                            report,
-                            "bytesSent",
-                            0,
-                        ) or 0
-                        p = getattr(
-                            report,
-                            "packetsSent",
-                            0,
-                        ) or 0
-
-                        db = b - last_bytes.get(sid, b)
-                        dp = p - last_packets.get(sid, p)
-
-                        last_bytes[sid] = b
-                        last_packets[sid] = p
-
-                        extra = ""
-
-                        fe = getattr(
-                            report,
-                            "framesEncoded",
-                            None,
-                        )
-                        fr = getattr(
-                            report,
-                            "framesSent",
-                            None,
-                        )
-                        retrans = getattr(
-                            report,
-                            "retransmittedPacketsSent",
-                            None,
-                        )
-
-                        if fe is not None:
-                            extra += f" framesEncoded={fe}"
-                        if fr is not None:
-                            extra += f" framesSent={fr}"
-                        if retrans is not None:
-                            extra += f" retrans={retrans}"
-
-                        lines.append(
-                            f"OUT {kind} "
-                            f"bitrate={db * 8 / 1e6:.2f}Mbps "
-                            f"packets/s={dp} "
-                            f"total={b / 1024 / 1024:.1f}MB"
-                            f"{extra}"
-                        )
-
-                    elif typ == "remote-inbound-rtp":
-                        kind = getattr(
-                            report,
-                            "kind",
-                            getattr(report, "mediaType", "?"),
-                        )
-                        rrtt = getattr(
-                            report,
-                            "roundTripTime",
-                            None,
-                        )
-                        frac = getattr(
-                            report,
-                            "fractionLost",
-                            None,
-                        )
-
-                        if rrtt is not None:
-                            rtt_ms = rrtt * 1000.0
-                            self._diag_add_sample(
-                                self._diag_rtt,
-                                f"remote-{kind}",
-                                rtt_ms,
-                            )
-                            lines.append(
-                                f"REMOTE {kind} "
-                                f"rtt={rtt_ms:.1f}ms "
-                            )
-                        else:
-                            lines.append(
-                                f"REMOTE {kind} "
-                            )
-
-                        if frac is not None:
-                            lines[-1] += (
-                                f"loss={frac * 100:.2f}%"
-                            )
-
-                # Track-side production stats.
-                track_frames = self._video_track_frames
-                now2 = time.monotonic()
-
-                prev_frames = getattr(
-                    self,
-                    "_diag_prev_track_frames",
-                    track_frames,
-                )
-                prev_t = getattr(
-                    self,
-                    "_diag_prev_track_t",
-                    now2,
-                )
-
-                fps = (
-                    (track_frames - prev_frames)
-                    / max(now2 - prev_t, 1e-6)
-                )
-
-                self._diag_prev_track_frames = track_frames
-                self._diag_prev_track_t = now2
-
-                print(
-                    f"[WEBRTC][STATS] loop_delay="
-                    f"{loop_delay_ms:.1f}ms"
-                )
-                print(
-                    "[VIDEO][TRACK] "
-                    f"frames={track_frames} "
-                    f"fps={fps:.1f} "
-                    f"max_recv_wait="
-                    f"{self._video_track_max_gap_ms:.1f}ms"
-                )
-
-                self._video_track_max_gap_ms = 0.0
-
-                for line in lines:
-                    print(
-                        f"[WEBRTC][STATS] {line}"
-                    )
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            print(
-                f"[WEBRTC][STATS] diagnostics stopped: {exc}"
-            )
-
-
     def _register_events(
         self
     ):
@@ -563,15 +222,30 @@ class PeerConnection:
             state = self.pc.connectionState
 
             print("[WEBRTC] Connection state:", state)
+
+            if self._stopping:
+                return
             sctp = getattr(self.pc, "sctp", None)
             dtls = getattr(sctp, "transport", None) if sctp is not None else None
             if dtls is not None:
                 print("[WEBRTC] DTLS state:", getattr(dtls, "state", "unknown"))
 
-            if state in ("failed", "disconnected"):
+            if state == "connected":
+                self._cancel_disconnect_watch()
 
-                if self.on_disconnected is not None:
-                    await self.on_disconnected()
+            elif state in ("disconnected", "failed"):
+                # A transport failure is not enough to declare the session
+                # intentionally closed. Give ICE/WebRTC time to recover.
+                self._schedule_disconnect_watch()
+
+            elif state == "closed":
+                self._cancel_disconnect_watch()
+
+                # Normally a graceful remote close is preceded by
+                # SESSION_CLOSE on the DataChannel. If the peer is already
+                # gone (for example the process was killed), there is no
+                # such message and we simply treat this as a transport loss.
+                self._schedule_disconnect_watch()
 
 
         @self.pc.on(
@@ -622,6 +296,45 @@ class PeerConnection:
                 channel
             )
 
+
+    def _cancel_disconnect_watch(self):
+        task = self._disconnect_task
+        self._disconnect_task = None
+
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_disconnect_watch(self):
+        task = self._disconnect_task
+
+        if task is not None and not task.done():
+            return
+
+        self._disconnect_task = asyncio.create_task(
+            self._disconnect_watchdog()
+        )
+
+    async def _disconnect_watchdog(self):
+        try:
+            # aiortc can recover a temporary network loss by itself. Give it
+            # a short grace period before destroying the session.
+            await asyncio.sleep(15.0)
+
+            if self.pc is None or self._stopping:
+                return
+
+            state = self.pc.connectionState
+
+            if state in ("disconnected", "failed", "closed"):
+                print("[WEBRTC] Connection timeout -> ending session")
+                if self.on_disconnected is not None:
+                    await self.on_disconnected()
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._disconnect_task is asyncio.current_task():
+                self._disconnect_task = None
 
     # ================================================================
     # SAFE DATA CHANNEL SEND
@@ -793,12 +506,15 @@ class PeerConnection:
             )
 
 
+            if text == "SESSION_CLOSE":
+                print("[WEBRTC] Remote requested session close")
+                if self.on_session_close is not None:
+                    asyncio.create_task(self.on_session_close())
+                return
+
             if text == "PING":
-
-
                 if self._safe_channel_send("PONG"):
                     print("[DATA] TX -> PONG")
-
 
             if self.on_text:
 
@@ -955,6 +671,27 @@ class PeerConnection:
     # ================================================================
 
     async def create_offer(self):
+
+        if self.pc is not None:
+            state = self.pc.connectionState
+
+            # Reconnecting the signaling WebSocket must not renegotiate an
+            # already healthy WebRTC session.
+            if state in (
+                "new",
+                "connecting",
+                "connected",
+                "checking",
+                "disconnected",
+            ):
+                print(
+                    f"[WEBRTC] Existing session state={state}; "
+                    "no new offer needed"
+                )
+                return
+
+            # A failed/closed PeerConnection can be replaced safely.
+            await self.stop_session()
 
         if self.pc is None:
             await self.start_session()
@@ -1157,12 +894,6 @@ class PeerConnection:
 
 
 
-        elif message_type == "client_disconnected":
-
-            print("[SIGNALING] Client disconnected")
-
-            if self.on_disconnected is not None:
-                await self.on_disconnected()
 
 
     # ================================================================
@@ -1205,22 +936,9 @@ class PeerConnection:
             return
 
         self._stopping = True
+        self._cancel_disconnect_watch()
 
         print("[WEBRTC] Stopping session")
-
-        if self._stats_task is not None:
-            if not self._stats_task.done():
-                self._stats_task.cancel()
-                try:
-                    await self._stats_task
-                except asyncio.CancelledError:
-                    pass
-            self._stats_task = None
-
-        # Print one compact final report after the test is stopped.
-        # This is intentionally done here so the user can simply run a test,
-        # stop LazyPC, and paste the final summary.
-        self._print_diagnostic_summary()
 
         # ================================================================
         # STOP CURSOR SYNC

@@ -110,11 +110,11 @@ Mouse movement is also restricted to the currently visible part of the remote de
 - [x] Keyboard input
 - [x] Basic keyboard shortcuts
 - [x] Audio streaming
+- [x] Connection status indicator
 
 ### Planned
 
 - [ ] Clipboard synchronization
-- [ ] Connection status indicator
 - [ ] Performance statistics
 - [ ] FPS monitoring
 - [ ] Latency monitoring

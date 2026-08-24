@@ -76,7 +76,6 @@ class ConnectionRegistry:
             return peer
 
     async def notify_client_connected(self) -> None:
-
         agent = await self.get_peer(PeerRole.CLIENT)
 
         if agent is None:
@@ -85,20 +84,6 @@ class ConnectionRegistry:
         try:
             await agent.send_json({
                 "type": "create_session"
-            })
-        except Exception:
-            pass
-
-    async def notify_client_disconnected(self) -> None:
-
-        agent = await self.get_peer(PeerRole.CLIENT)
-
-        if agent is None:
-            return
-
-        try:
-            await agent.send_json({
-                "type": "client_disconnected"
             })
         except Exception:
             pass

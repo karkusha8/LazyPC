@@ -112,12 +112,14 @@ class Agent:
         # ============================================================
 
         self.peer.on_disconnected = self._on_peer_closed
+        self.peer.on_session_close = self._on_session_close
 
         # ============================================================
         # CLOSE EVENT
         # ============================================================
 
         self._closed_event = asyncio.Event()
+        self._stopping = False
 
         print(
             "[INPUT] DataChannel input pipeline initialized"
@@ -167,13 +169,13 @@ class Agent:
     ):
 
         print(
-            "[AGENT] Signaling disconnected"
+            "[AGENT] Signaling disconnected (WebRTC is kept alive)"
         )
 
         # The client may disappear without sending final KEY UP packets.
+        # Signaling is only the control/negotiation transport and must not
+        # determine the lifetime of the Agent or PeerConnection.
         self.keyboard_state.release_all()
-
-        self._closed_event.set()
     # ================================================================
     # INPUT PACKET
     # ================================================================
@@ -219,6 +221,10 @@ class Agent:
 
     async def stop(self):
 
+        if self._stopping:
+            return
+
+        self._stopping = True
         print("[AGENT] Stopping")
 
         total = time.perf_counter()
@@ -278,11 +284,24 @@ class Agent:
     # PEER CLOSED
     # ================================================================
 
+    async def _on_session_close(self):
+
+        print("[AGENT] Client requested session close")
+
+        # Explicit close: tear down immediately instead of waiting for the
+        # network-loss watchdog.
+        self.keyboard_state.release_all()
+
+        await self.peer.stop_session()
+
+        print("[AGENT] Waiting for next client...")
+
     async def _on_peer_closed(self):
 
         print("[AGENT] Peer disconnected")
 
-        # WebRTC can disappear before Android sends KEY UP.
+        # No explicit SESSION_CLOSE arrived. The PeerConnection watchdog
+        # decides when a temporary network loss has lasted too long.
         self.keyboard_state.release_all()
 
         await self.peer.stop_session()

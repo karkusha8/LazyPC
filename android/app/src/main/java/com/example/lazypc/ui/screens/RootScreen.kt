@@ -49,7 +49,11 @@ fun RootScreen(
     onMouseActionBoundsChanged: (Float, Float, Float, Float) -> Unit,
     keyboardEngine: KeyboardEngine,
     keyboardEmitter: KeyboardEmitter,
-    onDragModeChanged: (Boolean) -> Unit
+    onDragModeChanged: (Boolean) -> Unit,
+    sessionConnecting: Boolean,
+    sessionConnected: Boolean,
+    onConnectSession: () -> Unit,
+    onDisconnectSession: () -> Unit
 ) {
     var keyboardVisible by remember { mutableStateOf(false) }
     var dragModeEnabled by remember { mutableStateOf(false) }
@@ -201,6 +205,13 @@ fun RootScreen(
             )
         }
 
+        SessionControl(
+            connecting = sessionConnecting,
+            connected = sessionConnected,
+            onConnect = onConnectSession,
+            onDisconnect = onDisconnectSession
+        )
+
         if (keyboardVisible) {
             KeyboardScreen(
                 modifier =
@@ -227,6 +238,56 @@ fun RootScreen(
                 onDragModeChanged(dragModeEnabled)
             }
         )
+    }
+}
+
+@Composable
+private fun SessionControl(
+    connecting: Boolean,
+    connected: Boolean,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(52.dp)
+            .background(Color.Black),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val label =
+            when {
+                connected -> "● ОТКЛЮЧИТЬ"
+                connecting -> "● ПОДКЛЮЧЕНИЕ..."
+                else -> "○ ПОДКЛЮЧИТЬ"
+            }
+
+        Button(
+            onClick = {
+                if (connected || connecting) {
+                    if (connected) onDisconnect()
+                } else {
+                    onConnect()
+                }
+            },
+            enabled = !connecting,
+            contentPadding = PaddingValues(
+                horizontal = 20.dp,
+                vertical = 0.dp
+            ),
+            colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                containerColor =
+                    if (connected) Color(0xFF8B1E1E)
+                    else Color(0xFF2C2C2C),
+                disabledContainerColor = Color(0xFF2C2C2C)
+            )
+        ) {
+            Text(
+                text = label,
+                color = Color.White
+            )
+        }
     }
 }
 

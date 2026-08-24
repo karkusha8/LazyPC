@@ -13,7 +13,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
-
 class WebRTCClient(
 
     private val context: Context,
@@ -34,26 +33,20 @@ class WebRTCClient(
 
         private const val PACKET_CURSOR_POSITION =
             0x60
-    }
 
+        private const val SESSION_CLOSE = "SESSION_CLOSE"
+    }
 
     private lateinit var factory:
             PeerConnectionFactory
 
-
     private var peerConnection:
             PeerConnection? = null
-
 
     private var dataChannel:
             DataChannel? = null
 
     private var statsExecutor: ScheduledExecutorService? = null
-
-    private var statsLastPacketsReceived = -1L
-    private var statsLastBytesReceived = -1L
-    private var statsLastFramesReceived = -1L
-    private var statsLastFramesDecoded = -1L
 
     // Session diagnostics. These are diagnostic-only and do not affect media.
     private var diagnosticsStartedAtNs = 0L
@@ -74,11 +67,9 @@ class WebRTCClient(
                 .builder(context)
                 .createInitializationOptions()
 
-
         PeerConnectionFactory.initialize(
             options
         )
-
 
         // Route the communication audio BEFORE WebRTC creates its audio
         // device module. This avoids initializing the AudioTrack on the
@@ -132,7 +123,6 @@ class WebRTCClient(
                 .createPeerConnectionFactory()
     }
 
-
     /**
      * Keep Android in normal media mode.
      *
@@ -164,6 +154,48 @@ class WebRTCClient(
         )
     }
 
+    fun connectionState(): PeerConnection.PeerConnectionState? {
+        return peerConnection?.connectionState()
+    }
+
+    fun iceConnectionState(): PeerConnection.IceConnectionState? {
+        return peerConnection?.iceConnectionState()
+    }
+
+    fun isConnectionHealthy(): Boolean {
+        val pc = peerConnection ?: return false
+        return pc.connectionState() == PeerConnection.PeerConnectionState.CONNECTED ||
+                pc.iceConnectionState() == PeerConnection.IceConnectionState.CONNECTED ||
+                pc.iceConnectionState() == PeerConnection.IceConnectionState.COMPLETED
+    }
+
+    fun isConnectionDead(): Boolean {
+        val pc = peerConnection ?: return true
+        return pc.connectionState() == PeerConnection.PeerConnectionState.FAILED ||
+                pc.connectionState() == PeerConnection.PeerConnectionState.CLOSED ||
+                pc.iceConnectionState() == PeerConnection.IceConnectionState.FAILED ||
+                pc.iceConnectionState() == PeerConnection.IceConnectionState.CLOSED
+    }
+
+    /**
+     * Destroy only the current PeerConnection. The factory and audio module
+     * stay alive so a new WebRTC session can be negotiated cheaply.
+     */
+    fun resetPeerConnection() {
+        Log.d("WEBRTC", "♻️ Resetting PeerConnection for recovery")
+
+        // Recovery is not an intentional user disconnect. Do not send
+        // SESSION_CLOSE here, otherwise Windows would destroy the session
+        // while Android is trying to rebuild it.
+        dataChannel?.close()
+        dataChannel = null
+
+        peerConnection?.close()
+        peerConnection = null
+
+        createPeerConnection()
+    }
+
     fun createPeerConnection(): PeerConnection {
 
         val config =
@@ -171,14 +203,12 @@ class WebRTCClient(
                 emptyList()
             )
 
-
         peerConnection =
             factory.createPeerConnection(
 
                 config,
 
                 object : PeerConnection.Observer {
-
 
                     override fun onIceCandidate(
                         candidate: IceCandidate?
@@ -194,7 +224,6 @@ class WebRTCClient(
                             onIce(it)
                         }
                     }
-
 
                     override fun onIceConnectionChange(
                         state: PeerConnection.IceConnectionState?
@@ -215,7 +244,6 @@ class WebRTCClient(
                         }
                     }
 
-
                     override fun onTrack(
                         transceiver: RtpTransceiver?
                     ) {
@@ -224,7 +252,6 @@ class WebRTCClient(
                             transceiver
                                 ?.receiver
                                 ?.track()
-
 
                         if (track is VideoTrack) {
 
@@ -248,7 +275,6 @@ class WebRTCClient(
                         }
                     }
 
-
                     override fun onDataChannel(
                         channel: DataChannel?
                     ) {
@@ -263,20 +289,16 @@ class WebRTCClient(
                             return
                         }
 
-
                         Log.d(
                             "DATA",
                             "📡 DataChannel received"
                         )
 
-
                         dataChannel = channel
-
 
                         channel.registerObserver(
 
                             object : DataChannel.Observer {
-
 
                                 override fun onBufferedAmountChange(
                                     previousAmount: Long
@@ -288,7 +310,6 @@ class WebRTCClient(
                                     )
                                 }
 
-
                                 override fun onStateChange() {
 
                                     Log.d(
@@ -296,7 +317,6 @@ class WebRTCClient(
                                         "STATE = ${channel.state()}"
                                     )
                                 }
-
 
                                 override fun onMessage(
                                     buffer: DataChannel.Buffer
@@ -315,18 +335,14 @@ class WebRTCClient(
                                                 buffer.data.remaining()
                                             )
 
-
                                         buffer.data.get(bytes)
-
 
                                         handleBinaryMessage(
                                             bytes
                                         )
 
-
                                         return
                                     }
-
 
                                     /*
                                      * ==============================
@@ -334,25 +350,20 @@ class WebRTCClient(
                                      * ==============================
                                      */
 
-
                                     val bytes =
                                         ByteArray(
                                             buffer.data.remaining()
                                         )
 
-
                                     buffer.data.get(bytes)
-
 
                                     val text =
                                         String(bytes)
-
 
                                     Log.d(
                                         "DATA",
                                         "📥 RX TEXT = $text"
                                     )
-
 
                                     if (text == "PONG") {
 
@@ -366,18 +377,15 @@ class WebRTCClient(
                         )
                     }
 
-
                     override fun onSignalingChange(
                         state: PeerConnection.SignalingState?
                     ) {
                     }
 
-
                     override fun onIceConnectionReceivingChange(
                         receiving: Boolean
                     ) {
                     }
-
 
                     override fun onIceGatheringChange(
                         state: PeerConnection.IceGatheringState?
@@ -389,28 +397,23 @@ class WebRTCClient(
                         )
                     }
 
-
                     override fun onIceCandidatesRemoved(
                         candidates: Array<out IceCandidate>?
                     ) {
                     }
-
 
                     override fun onAddStream(
                         stream: MediaStream?
                     ) {
                     }
 
-
                     override fun onRemoveStream(
                         stream: MediaStream?
                     ) {
                     }
 
-
                     override fun onRenegotiationNeeded() {
                     }
-
 
                     override fun onAddTrack(
                         receiver: RtpReceiver?,
@@ -436,7 +439,6 @@ class WebRTCClient(
          * ============================================================
          */
 
-
         peerConnection?.addTransceiver(
 
             MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
@@ -453,8 +455,6 @@ class WebRTCClient(
 
         return peerConnection!!
     }
-
-
 
     /*
      * ================================================================
@@ -486,7 +486,6 @@ class WebRTCClient(
         // guarantees that the terminal always receives recent data.
         statsExecutor?.scheduleAtFixedRate(
             {
-                printDiagnosticsSummary(periodic = true)
             },
             5,
             5,
@@ -499,8 +498,6 @@ class WebRTCClient(
 
         pc.getStats(object : RTCStatsCollectorCallback {
             override fun onStatsDelivered(report: RTCStatsReport) {
-                var foundInboundVideo = false
-
                 for (stat in report.getStatsMap().values) {
                     val values = stat.members
 
@@ -508,14 +505,11 @@ class WebRTCClient(
                         val mediaType = values["kind"] ?: values["mediaType"]
 
                         if (mediaType?.toString() == "video") {
-                            foundInboundVideo = true
-
                             val packetsReceived = statLong(values, "packetsReceived")
                             val packetsLost = statLong(values, "packetsLost")
                             val bytesReceived = statLong(values, "bytesReceived")
                             val framesReceived = statLong(values, "framesReceived")
                             val framesDecoded = statLong(values, "framesDecoded")
-                            val framesDropped = statLong(values, "framesDropped")
                             val jitter = statDouble(values, "jitter")
                             val decodeTime = statDouble(values, "totalDecodeTime")
                             val freezeCount = statLong(values, "freezeCount")
@@ -527,30 +521,6 @@ class WebRTCClient(
                             if (freezesDuration >= 0.0) diagnosticsLastFreezeDuration = freezesDuration
                             diagnosticsLastVideoPackets = packetsReceived
                             diagnosticsLastVideoLost = packetsLost
-
-                            Log.d(
-                                "VIDEO_STATS",
-                                "[VIDEO][IN] " +
-                                        "packets=$packetsReceived " +
-                                        "lost=$packetsLost " +
-                                        "bytes=$bytesReceived " +
-                                        "framesRx=$framesReceived " +
-                                        "framesDecoded=$framesDecoded " +
-                                        "dropped=$framesDropped " +
-                                        "jitter=${formatStat(jitter)} " +
-                                        "decodeTime=${formatStat(decodeTime)} " +
-                                        "freezeCount=$freezeCount " +
-                                        "freezeDuration=${formatStat(freezesDuration)} " +
-                                        "dPackets=${delta(statsLastPacketsReceived, packetsReceived)} " +
-                                        "dFramesRx=${delta(statsLastFramesReceived, framesReceived)} " +
-                                        "dDecoded=${delta(statsLastFramesDecoded, framesDecoded)} " +
-                                        "dBytes=${delta(statsLastBytesReceived, bytesReceived)}"
-                            )
-
-                            statsLastPacketsReceived = packetsReceived
-                            statsLastBytesReceived = bytesReceived
-                            statsLastFramesReceived = framesReceived
-                            statsLastFramesDecoded = framesDecoded
                         }
                     }
 
@@ -563,16 +533,6 @@ class WebRTCClient(
 
                             diagnosticsLastAudioPackets = packets
                             diagnosticsLastAudioLost = lost
-
-                            Log.d(
-                                "AUDIO_STATS",
-                                "[AUDIO][IN] packets=$packets lost=$lost bytes=$bytes " +
-                                        "dPackets=${delta(statsLastAudioPacketsForLog, packets)} " +
-                                        "dLost=${delta(statsLastAudioLostForLog, lost)}"
-                            )
-
-                            statsLastAudioPacketsForLog = packets
-                            statsLastAudioLostForLog = lost
                         }
                     }
 
@@ -586,19 +546,9 @@ class WebRTCClient(
                         }
                     }
                 }
-
-                if (!foundInboundVideo) {
-                    Log.w(
-                        "VIDEO_STATS",
-                        "[VIDEO][IN] No inbound video RTP stats found"
-                    )
-                }
             }
         })
     }
-
-    private var statsLastAudioPacketsForLog = -1L
-    private var statsLastAudioLostForLog = -1L
 
     private fun resetDiagnostics() {
         diagnosticsRttSamplesMs.clear()
@@ -613,136 +563,7 @@ class WebRTCClient(
         diagnosticsLastVideoLost = -1L
         diagnosticsLastAudioPackets = -1L
         diagnosticsLastAudioLost = -1L
-        statsLastAudioPacketsForLog = -1L
-        statsLastAudioLostForLog = -1L
     }
-
-    /*
-     * ================================================================
-     * SESSION DIAGNOSTICS SUMMARY
-     * ================================================================
-     *
-     * Diagnostics only. This does not change media behaviour.
-     *
-     * Logcat filter:
-     *
-     *     tag:LAZYPC_DIAG
-     *
-     * The average is the real arithmetic mean:
-     *
-     *     sum(all samples) / number of samples
-     *
-     * It is NOT (min + max) / 2.
-     */
-    private fun printDiagnosticsSummary(periodic: Boolean = false) {
-        val started = diagnosticsStartedAtNs
-        if (started <= 0L) return
-
-        val durationSec =
-            (System.nanoTime() - started).coerceAtLeast(0L) / 1_000_000_000.0
-
-        Log.d("LAZYPC_DIAG", "================================================================================")
-        Log.d(
-            "LAZYPC_DIAG",
-            if (periodic) {
-                "[DIAG][SNAPSHOT] SESSION DIAGNOSTICS (every 5s)"
-            } else {
-                "[DIAG][SUMMARY] SESSION DIAGNOSTICS"
-            }
-        )
-        Log.d("LAZYPC_DIAG", "================================================================================")
-        Log.d(
-            "LAZYPC_DIAG",
-            "[DIAG][SUMMARY] duration=${String.format(java.util.Locale.US, "%.1f", durationSec)}s"
-        )
-
-        Log.d(
-            "LAZYPC_DIAG",
-            "[DIAG][SUMMARY] RTT statistics (real arithmetic mean):"
-        )
-
-        if (diagnosticsRttSamplesMs.isEmpty()) {
-            Log.d("LAZYPC_DIAG", "[DIAG][RTT] network: no samples")
-        } else {
-            val min = diagnosticsRttSamplesMs.minOrNull() ?: 0.0
-            val max = diagnosticsRttSamplesMs.maxOrNull() ?: 0.0
-            val avg = diagnosticsRttSamplesMs.sum() / diagnosticsRttSamplesMs.size.toDouble()
-
-            Log.d(
-                "LAZYPC_DIAG",
-                "[DIAG][RTT] network: " +
-                        "min=${formatMs(min)} " +
-                        "avg=${formatMs(avg)} " +
-                        "max=${formatMs(max)} " +
-                        "samples=${diagnosticsRttSamplesMs.size}"
-            )
-        }
-
-        val videoLossText =
-            if (diagnosticsLastVideoPackets >= 0L && diagnosticsLastVideoLost >= 0L) {
-                val total = diagnosticsLastVideoPackets + diagnosticsLastVideoLost
-                if (total > 0L) {
-                    String.format(
-                        java.util.Locale.US,
-                        "%.2f%%",
-                        diagnosticsLastVideoLost * 100.0 / total.toDouble()
-                    )
-                } else {
-                    "0.00%"
-                }
-            } else {
-                "-"
-            }
-
-        val audioLossText =
-            if (diagnosticsLastAudioPackets >= 0L && diagnosticsLastAudioLost >= 0L) {
-                val total = diagnosticsLastAudioPackets + diagnosticsLastAudioLost
-                if (total > 0L) {
-                    String.format(
-                        java.util.Locale.US,
-                        "%.2f%%",
-                        diagnosticsLastAudioLost * 100.0 / total.toDouble()
-                    )
-                } else {
-                    "0.00%"
-                }
-            } else {
-                "-"
-            }
-
-        Log.d(
-            "LAZYPC_DIAG",
-            "[DIAG][VIDEO] " +
-                    "freezes=${if (diagnosticsLastFreezeCount >= 0L) diagnosticsLastFreezeCount else "-"} " +
-                    "freezeDuration=${if (diagnosticsLastFreezeDuration >= 0.0) formatSeconds(diagnosticsLastFreezeDuration) else "-"} " +
-                    "packetLoss=$videoLossText " +
-                    "maxJitter=${formatStat(diagnosticsMaxVideoJitter)} " +
-                    "maxDecodeTime=${formatSeconds(diagnosticsMaxVideoDecodeTime)}"
-        )
-
-        Log.d(
-            "LAZYPC_DIAG",
-            "[DIAG][AUDIO] " +
-                    "packets=${if (diagnosticsLastAudioPackets >= 0L) diagnosticsLastAudioPackets else "-"} " +
-                    "lost=${if (diagnosticsLastAudioLost >= 0L) diagnosticsLastAudioLost else "-"} " +
-                    "packetLoss=$audioLossText"
-        )
-
-        Log.d(
-            "LAZYPC_DIAG",
-            "[DIAG][VIDEO_RENDER] frame-gap/fps summary is printed by CustomVideoRenderer"
-        )
-
-        Log.d("LAZYPC_DIAG", "================================================================================")
-        Log.d("LAZYPC_DIAG", "[DIAG][SUMMARY] END")
-        Log.d("LAZYPC_DIAG", "================================================================================")
-    }
-
-    private fun formatMs(value: Double): String =
-        String.format(java.util.Locale.US, "%.1fms", value)
-
-    private fun formatSeconds(value: Double): String =
-        String.format(java.util.Locale.US, "%.3fs", value)
 
     private fun statLong(
         values: Map<String, Any>,
@@ -764,11 +585,6 @@ class WebRTCClient(
         }
     }
 
-    private fun delta(previous: Long, current: Long): Long {
-        if (previous < 0L || current < 0L) return -1L
-        return current - previous
-    }
-
     private fun formatStat(value: Double): String {
         if (value < 0.0) return "-"
         return String.format(java.util.Locale.US, "%.4f", value)
@@ -780,7 +596,6 @@ class WebRTCClient(
      * ================================================================
      */
 
-
     private fun handleBinaryMessage(
         bytes: ByteArray
     ) {
@@ -789,15 +604,12 @@ class WebRTCClient(
             return
         }
 
-
         val packetType =
             bytes[0]
                 .toInt()
                 .and(0xFF)
 
-
         when (packetType) {
-
 
             PACKET_CURSOR_POSITION -> {
 
@@ -811,7 +623,6 @@ class WebRTCClient(
                  * Total: 9 bytes
                  */
 
-
                 if (bytes.size != 9) {
 
                     Log.w(
@@ -821,7 +632,6 @@ class WebRTCClient(
 
                     return
                 }
-
 
                 val byteBuffer =
                     ByteBuffer
@@ -834,21 +644,17 @@ class WebRTCClient(
                             ByteOrder.BIG_ENDIAN
                         )
 
-
                 val normalizedX =
                     byteBuffer.float
 
-
                 val normalizedY =
                     byteBuffer.float
-
 
                 onCursorPosition(
                     normalizedX,
                     normalizedY
                 )
             }
-
 
             else -> {
 
@@ -860,7 +666,6 @@ class WebRTCClient(
         }
     }
 
-
     fun addRemoteCandidate(
         candidate: IceCandidate
     ) {
@@ -870,12 +675,10 @@ class WebRTCClient(
             "📥 ADD REMOTE ICE: ${candidate.sdp}"
         )
 
-
         peerConnection?.addIceCandidate(
             candidate
         )
     }
-
 
     fun setRemoteOffer(
         sdp: String,
@@ -885,7 +688,6 @@ class WebRTCClient(
         val pc =
             peerConnection ?: return
 
-
         val offer =
             SessionDescription(
 
@@ -893,7 +695,6 @@ class WebRTCClient(
 
                 sdp
             )
-
 
         Log.d(
             "SDP",
@@ -910,30 +711,24 @@ class WebRTCClient(
             "======================================="
         )
 
-
         pc.setRemoteDescription(
 
             object : SdpObserver {
 
-
                 override fun onSetSuccess() {
-
 
                     Log.d(
                         "WEBRTC",
                         "✅ REMOTE SDP SET"
                     )
 
-
                     pc.createAnswer(
 
                         object : SdpObserver {
 
-
                             override fun onCreateSuccess(
                                 answer: SessionDescription
                             ) {
-
 
                                 Log.d(
                                     "SDP",
@@ -950,11 +745,9 @@ class WebRTCClient(
                                     "========================================"
                                 )
 
-
                                 pc.setLocalDescription(
 
                                     object : SdpObserver {
-
 
                                         override fun onSetSuccess() {
 
@@ -968,7 +761,6 @@ class WebRTCClient(
                                             )
                                         }
 
-
                                         override fun onSetFailure(
                                             error: String?
                                         ) {
@@ -979,12 +771,10 @@ class WebRTCClient(
                                             )
                                         }
 
-
                                         override fun onCreateSuccess(
                                             description: SessionDescription?
                                         ) {
                                         }
-
 
                                         override fun onCreateFailure(
                                             error: String?
@@ -997,10 +787,8 @@ class WebRTCClient(
                                 )
                             }
 
-
                             override fun onSetSuccess() {
                             }
-
 
                             override fun onSetFailure(
                                 error: String?
@@ -1011,7 +799,6 @@ class WebRTCClient(
                                     "ANSWER ERROR: $error"
                                 )
                             }
-
 
                             override fun onCreateFailure(
                                 error: String?
@@ -1029,7 +816,6 @@ class WebRTCClient(
                     )
                 }
 
-
                 override fun onSetFailure(
                     error: String?
                 ) {
@@ -1040,12 +826,10 @@ class WebRTCClient(
                     )
                 }
 
-
                 override fun onCreateSuccess(
                     description: SessionDescription?
                 ) {
                 }
-
 
                 override fun onCreateFailure(
                     error: String?
@@ -1058,18 +842,18 @@ class WebRTCClient(
         )
     }
 
-
-    fun close() {
+    fun close(sendSessionClose: Boolean = true) {
         Log.d("WEBRTC", "Closing WebRTC client")
 
-        printDiagnosticsSummary()
+        // Tell Windows explicitly when this side is intentionally ending the
+        // session. Network loss / process kill cannot send this message, so
+        // Windows will keep the session alive until its transport timeout.
+        if (sendSessionClose) {
+            sendText(SESSION_CLOSE)
+        }
 
         statsExecutor?.shutdownNow()
         statsExecutor = null
-        statsLastPacketsReceived = -1L
-        statsLastBytesReceived = -1L
-        statsLastFramesReceived = -1L
-        statsLastFramesDecoded = -1L
         diagnosticsStartedAtNs = 0L
 
         clearAudioRoute()
@@ -1086,20 +870,17 @@ class WebRTCClient(
         Log.d("WEBRTC", "WebRTC client closed")
     }
 
-
     /*
      * ================================================================
      * SEND BINARY THROUGH DATACHANNEL
      * ================================================================
      */
 
-
     fun sendBinary(
         data: ByteArray
     ): Boolean {
 
         val channel = dataChannel
-
 
         if (channel == null) {
 
@@ -1111,7 +892,6 @@ class WebRTCClient(
             return false
         }
 
-
         if (channel.state() != DataChannel.State.OPEN) {
 
             Log.w(
@@ -1122,7 +902,6 @@ class WebRTCClient(
             return false
         }
 
-
         val buffer =
             DataChannel.Buffer(
 
@@ -1131,10 +910,8 @@ class WebRTCClient(
                 true
             )
 
-
         val result =
             channel.send(buffer)
-
 
         if (!result) {
 
@@ -1144,17 +921,14 @@ class WebRTCClient(
             )
         }
 
-
         return result
     }
-
 
     /*
      * ================================================================
      * SEND TEXT
      * ================================================================
      */
-
 
     fun sendText(
         text: String
@@ -1163,14 +937,12 @@ class WebRTCClient(
         val channel =
             dataChannel ?: return false
 
-
         if (
             channel.state() != DataChannel.State.OPEN
         ) {
 
             return false
         }
-
 
         val buffer =
             DataChannel.Buffer(
@@ -1182,12 +954,10 @@ class WebRTCClient(
                 false
             )
 
-
         return channel.send(
             buffer
         )
     }
-
 
     /*
      * ================================================================
@@ -1195,14 +965,12 @@ class WebRTCClient(
      * ================================================================
      */
 
-
     fun sendPing() {
 
         val result =
             sendText(
                 "PING"
             )
-
 
         if (result) {
 

@@ -15,6 +15,9 @@ BITRATE = 8_000_000
 class H264NVENCEncoder(_AiortcH264Encoder):
     """H.264 encoder backed by NVIDIA NVENC."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
     def _encode_frame(
         self,
         frame: av.VideoFrame,
@@ -84,30 +87,18 @@ class H264NVENCEncoder(_AiortcH264Encoder):
             )
             self._diag_encode_max_ms = max_ms
 
-            if encode_ms > 20.0:
-                print(
-                    "[VIDEO][ENCODE][SLOW] "
-                    f"frame={count} encode={encode_ms:.2f}ms "
-                    f"packet_bytes={packet_bytes} "
-                    f"packets={packet_count} nals={nal_count}"
-                )
-
-            if count % 60 == 0:
-                print(
-                    "[VIDEO][ENCODE] "
-                    f"frames={count} "
-                    f"last={encode_ms:.2f}ms "
-                    f"max={max_ms:.2f}ms "
-                    f"packet_bytes={packet_bytes} "
-                    f"nals={nal_count}"
-                )
-
         except Exception as exc:
             print(
                 "[LazyPC][NVENC] FRAME ENCODE ERROR: "
                 f"{type(exc).__name__}: {exc}"
             )
             raise
+
+    def __del__(self):
+        try:
+            self._fps_diag_stop.set()
+        except Exception:
+            pass
 
     @staticmethod
     def _split_annex_b(data: bytes) -> list[bytes]:

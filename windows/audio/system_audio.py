@@ -211,30 +211,9 @@ class SystemAudioCapture:
         except queue.Empty:
             self._read_underruns += 1
 
-            now = time.monotonic()
-            if now - self._last_report >= 1.0:
-                print(
-                    "[AUDIO][BUFFER] "
-                    f"UNDERRUNS={self._read_underruns} "
-                    f"OVERFLOWS={self._queue_overflows} "
-                    f"DEPTH={self._queue.qsize()}/10"
-                )
-                self._last_report = now
-
             return silence
 
         self._last_depth = self._queue.qsize()
-
-        now = time.monotonic()
-        if now - self._last_report >= 1.0:
-            print(
-                "[AUDIO][BUFFER] "
-                f"depth={self._last_depth}/10 "
-                f"underruns={self._read_underruns} "
-                f"overflows={self._queue_overflows} "
-                f"callback_blocks={self._callback_blocks}"
-            )
-            self._last_report = now
 
         return data
 
