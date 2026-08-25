@@ -25,20 +25,35 @@ import org.webrtc.IceCandidate
 import org.webrtc.VideoTrack
 
 /**
+
  * Owns the long-lived LazyPC connection.
+
  *
+
  * Activity is UI only:
+
  * - creates/destroys TextureView/Compose UI;
+
  * - attaches the current VideoTrack to the renderer;
+
  * - sends user input through the WebRTCClient exposed by this service.
+
  *
+
  * The service owns:
+
  * - EglBase / WebRTCClient;
+
  * - PeerConnection;
+
  * - signaling WebSocket.
+
  *
+
  * This is intentionally the first clean service step. Recovery policy is
+
  * kept separate so a lifecycle migration cannot hide a reconnect bug.
+
  */
 class WebRTCForegroundService : Service() {
 
@@ -46,6 +61,7 @@ class WebRTCForegroundService : Service() {
         private const val TAG = "WEBRTC_SERVICE"
         private const val CHANNEL_ID = "lazypc_webrtc"
         private const val NOTIFICATION_ID = 1001
+        private const val SESSION_TIMEOUT_MS = 30_000L
         private const val SIGNALING_URL =
             "ws://192.168.0.148:8000/ws"
     }
@@ -68,6 +84,11 @@ class WebRTCForegroundService : Service() {
     private var sessionConnecting = false
     private var sessionConnected = false
     private var sessionGeneration = 0L
+    private var sessionTimeoutJob: kotlinx.coroutines.Job? = null
+
+    // Non-null only while a QR Trusted Device pairing session is being
+    // prepared. This is deliberately separate from a normal session.
+    private var pendingPairingPayload: String? = null
 
     private val serviceScope =
         CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -85,7 +106,10 @@ class WebRTCForegroundService : Service() {
 
         eglBase = EglBase.create()
 
-        ws = WsClient(SIGNALING_URL)
+        ws = WsClient(
+            context = this,
+            url = SIGNALING_URL
+        )
 
         ws.setOnConnectionState { connected ->
             Log.d(
@@ -98,6 +122,17 @@ class WebRTCForegroundService : Service() {
             )
 
             onSignalingState?.invoke(connected)
+
+            if (!connected && sessionConnecting) {
+                failPendingSession("Signaling disconnected")
+                return@setOnConnectionState
+            }
+
+            // A QR pairing request may have been armed before the signaling
+            // socket finished connecting. Send the pairing session now.
+            if (connected) {
+                sendPendingPairingSession()
+            }
         }
 
         ws.setOnTextMessage { text ->
@@ -109,6 +144,9 @@ class WebRTCForegroundService : Service() {
             eglContext = eglBase.eglBaseContext,
 
             onFrame = { track ->
+                sessionTimeoutJob?.cancel()
+                sessionTimeoutJob = null
+
                 currentVideoTrack = track
                 sessionConnecting = false
                 sessionConnected = true
@@ -143,8 +181,11 @@ class WebRTCForegroundService : Service() {
         webrtc.createPeerConnection()
 
         // IMPORTANT:
+
         // Do not connect signaling automatically.
+
         // The user starts a real session from the UI button.
+
     }
 
     override fun onStartCommand(
@@ -191,9 +232,107 @@ class WebRTCForegroundService : Service() {
         sessionConnected = false
         onSessionState?.invoke(sessionConnecting, sessionConnected)
 
+        startSessionTimeout(sessionGeneration)
+
         Log.d(TAG, "▶ Starting LazyPC session")
 
         ws.connect()
+    }
+
+    /**
+     * Starts a Trusted Device enrollment session from a QR payload.
+     *
+     * This is intentionally NOT the same as connectSession():
+     * - the WebRTC pairing protocol is armed first;
+     * - the signaling create_session carries pairing_token;
+     * - Windows therefore enters pairing mode instead of normal AUTH.
+     */
+    fun connectTrustedPairingSession(qrPayload: String) {
+        if (sessionConnecting || sessionConnected) {
+            Log.w(TAG, "Trusted pairing requested while session is active")
+            return
+        }
+
+        if (qrPayload.isBlank()) {
+            Log.e(TAG, "Trusted pairing rejected: empty QR payload")
+            return
+        }
+
+        sessionGeneration++
+        sessionConnecting = true
+        sessionConnected = false
+        onSessionState?.invoke(true, false)
+
+        startSessionTimeout(sessionGeneration)
+
+        // Arm the DataChannel pairing protocol before negotiation.
+        webrtc.startTrustedPairing(qrPayload)
+
+        pendingPairingPayload = qrPayload
+
+        Log.d(TAG, "🔐 Starting Trusted Device pairing session")
+
+        if (ws.isConnected()) {
+            sendPendingPairingSession()
+        } else {
+            ws.connect()
+        }
+    }
+
+    private fun sendPendingPairingSession() {
+        val payload = pendingPairingPayload ?: return
+
+        if (!ws.isConnected()) {
+            return
+        }
+
+        pendingPairingPayload = null
+
+        try {
+            ws.startTrustedPairingSession(payload)
+            Log.d(TAG, "🔐 Trusted pairing create_session sent")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to start Trusted Device pairing", e)
+
+            sessionConnecting = false
+            sessionConnected = false
+            onSessionState?.invoke(false, false)
+        }
+    }
+
+    private fun startSessionTimeout(generation: Long) {
+        sessionTimeoutJob?.cancel()
+        sessionTimeoutJob = serviceScope.launch {
+            delay(SESSION_TIMEOUT_MS)
+            if (generation != sessionGeneration) return@launch
+            if (!sessionConnecting || sessionConnected) return@launch
+            Log.e(TAG, "⏱ Session connection timeout")
+            failPendingSession("Connection timeout")
+        }
+    }
+
+    private fun failPendingSession(reason: String) {
+        if (!sessionConnecting) return
+
+        Log.e(TAG, "❌ Session failed: $reason")
+        sessionTimeoutJob?.cancel()
+        sessionTimeoutJob = null
+        pendingPairingPayload = null
+        sessionGeneration++
+
+        sessionConnecting = false
+        sessionConnected = false
+        currentVideoTrack = null
+        onVideoTrackChanged?.invoke(null)
+        onSessionState?.invoke(false, false)
+
+        try {
+            webrtc.resetPeerConnection()
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to reset WebRTC after session failure", error)
+        }
+
+        ws.close()
     }
 
     fun disconnectSession() {
@@ -203,25 +342,36 @@ class WebRTCForegroundService : Service() {
 
         Log.d(TAG, "⏹ User requested session disconnect")
 
+        // Cancel a not-yet-sent QR pairing request as well.
+        pendingPairingPayload = null
+
         val generationAtDisconnect = sessionGeneration
+
+        sessionTimeoutJob?.cancel()
+        sessionTimeoutJob = null
 
         sessionConnecting = false
         sessionConnected = false
         onSessionState?.invoke(false, false)
 
         // SESSION_CLOSE is the explicit, intentional-close signal.
+
         // Windows can distinguish this from a network disappearance.
+
         val sent = webrtc.sendText("SESSION_CLOSE")
         Log.d(TAG, "SESSION_CLOSE sent=$sent")
 
         serviceScope.launch {
             // Give SCTP a short window to put SESSION_CLOSE on the wire.
+
             if (sent) {
                 delay(200)
             }
 
             // The user may have pressed CONNECT again during the short
+
             // graceful-close window. Never tear down the new session.
+
             if (generationAtDisconnect != sessionGeneration) {
                 return@launch
             }
@@ -230,11 +380,15 @@ class WebRTCForegroundService : Service() {
             onVideoTrackChanged?.invoke(null)
 
             // Keep the WebRTC factory alive, but replace only this session's
+
             // PeerConnection so the next CONNECT can negotiate a new session.
+
             webrtc.resetPeerConnection()
 
             // Signaling is no longer needed after P2P negotiation/session
+
             // teardown. It will be opened again by the next CONNECT.
+
             ws.close()
         }
     }
@@ -338,6 +492,11 @@ class WebRTCForegroundService : Service() {
         onVideoTrackChanged = null
         onCursorPosition = null
         onSignalingState = null
+        onSessionState = null
+
+        pendingPairingPayload = null
+        sessionTimeoutJob?.cancel()
+        sessionTimeoutJob = null
 
         serviceScope.cancel()
 

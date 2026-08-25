@@ -63,4 +63,7 @@ dependencies {
     implementation("com.google.android.exoplayer:exoplayer:2.19.1")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
+
+    // Google ML Kit: system QR scanner (no CAMERA permission required)
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 }

@@ -5,10 +5,13 @@ import android.media.AudioAttributes
 import android.media.AudioManager
 import android.os.Build
 import android.util.Log
+import android.util.Base64
+import org.json.JSONObject
 import org.webrtc.*
 import org.webrtc.audio.JavaAudioDeviceModule
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -27,7 +30,17 @@ class WebRTCClient(
 
     private var audioDeviceModule: JavaAudioDeviceModule? = null
 
+
+
+
 ) {
+    private val securityKeyStore =
+        com.example.lazypc.security.SecurityKeyStore()
+    private var hardwareAuthPending = false
+    private var hardwareAuthorized = false
+
+    private var trustedPairingInvitation: com.example.lazypc.security.TrustedPairing.Invitation? = null
+    private var trustedPairingStarted = false
 
     companion object {
 
@@ -187,6 +200,11 @@ class WebRTCClient(
         // Recovery is not an intentional user disconnect. Do not send
         // SESSION_CLOSE here, otherwise Windows would destroy the session
         // while Android is trying to rebuild it.
+        hardwareAuthPending = false
+        hardwareAuthorized = false
+        trustedPairingStarted = false
+        trustedPairingInvitation = null
+
         dataChannel?.close()
         dataChannel = null
 
@@ -218,7 +236,7 @@ class WebRTCClient(
 
                             Log.d(
                                 "WEBRTC",
-                                "📤 LOCAL ICE: ${it.sdp}"
+                                "📤 Local ICE candidate gathered"
                             )
 
                             onIce(it)
@@ -231,7 +249,7 @@ class WebRTCClient(
 
                         Log.d(
                             "WEBRTC",
-                            "🧊 ICE STATE: $state"
+                            "🧊 ICE connection state: $state"
                         )
 
                         if (
@@ -316,6 +334,10 @@ class WebRTCClient(
                                         "DATA",
                                         "STATE = ${channel.state()}"
                                     )
+
+                                    if (channel.state() == DataChannel.State.OPEN) {
+                                        sendTrustedPairingHello()
+                                    }
                                 }
 
                                 override fun onMessage(
@@ -365,6 +387,14 @@ class WebRTCClient(
                                         "📥 RX TEXT = $text"
                                     )
 
+                                    if (handleTrustedPairingChallenge(text)) {
+                                        return
+                                    }
+
+                                    if (handleHardwareAuthMessage(text)) {
+                                        return
+                                    }
+
                                     if (text == "PONG") {
 
                                         Log.d(
@@ -393,7 +423,7 @@ class WebRTCClient(
 
                         Log.d(
                             "WEBRTC",
-                            "🌐 GATHERING: $state"
+                            "🌐 ICE gathering state: $state"
                         )
                     }
 
@@ -596,6 +626,187 @@ class WebRTCClient(
      * ================================================================
      */
 
+    /**
+     * Begin Trusted Device enrollment from a scanned QR payload.
+     * The QR contains only the one-time pairing invitation.
+     */
+    fun startTrustedPairing(qrPayload: String) {
+        val pairing = com.example.lazypc.security.TrustedPairing(
+            context,
+            securityKeyStore,
+        )
+
+        trustedPairingInvitation = pairing.parseQrPayload(qrPayload)
+        trustedPairingStarted = true
+
+        Log.i(
+            "LazyPC-Security",
+            "Trusted Device pairing armed"
+        )
+
+        sendTrustedPairingHello()
+    }
+
+    private fun sendTrustedPairingHello() {
+        if (!trustedPairingStarted) return
+
+        val invitation = trustedPairingInvitation ?: return
+        val channel = dataChannel ?: return
+
+        if (channel.state() != DataChannel.State.OPEN) return
+
+        val hello = JSONObject().apply {
+            put("type", "pair_hello")
+            put("version", 1)
+            put("algorithm", "ECDSA-P256-HW-ATTESTATION")
+            put("pairing_token", invitation.token)
+        }
+
+        if (sendText(hello.toString())) {
+            Log.i(
+                "LazyPC-Security",
+                "PAIR_HELLO sent over WebRTC DataChannel"
+            )
+        }
+    }
+
+    private fun handleTrustedPairingChallenge(text: String): Boolean {
+        if (!trustedPairingStarted) return false
+
+        val json = try {
+            JSONObject(text)
+        } catch (_: Throwable) {
+            return false
+        }
+
+        if (json.optString("type") != "pair_challenge") {
+            return false
+        }
+
+        try {
+            val invitation = requireNotNull(trustedPairingInvitation)
+            val pairing = com.example.lazypc.security.TrustedPairing(
+                context,
+                securityKeyStore,
+            )
+
+            val response = pairing.createPairResponse(
+                invitation,
+                json,
+            )
+
+            require(sendText(response.toString())) {
+                "Failed to send PAIR_RESPONSE"
+            }
+
+            trustedPairingStarted = false
+            trustedPairingInvitation = null
+
+            Log.i(
+                "LazyPC-Security",
+                "Trusted Device pairing response sent"
+            )
+        } catch (error: Throwable) {
+            trustedPairingStarted = false
+            trustedPairingInvitation = null
+
+            Log.e(
+                "LazyPC-Security",
+                "Trusted Device pairing failed",
+                error
+            )
+        }
+
+        return true
+    }
+
+    private fun handleHardwareAuthMessage(text: String): Boolean {
+        val json = try {
+            JSONObject(text)
+        } catch (_: Throwable) {
+            return false
+        }
+
+        if (json.optString("type") != "hw_auth_challenge") {
+            return false
+        }
+
+        if (hardwareAuthPending) {
+            Log.w("LazyPC-Security", "Duplicate HW_AUTH_CHALLENGE ignored")
+            return true
+        }
+
+        try {
+            val version = json.optInt("version", -1)
+            val algorithm = json.optString("algorithm")
+            val sessionId = json.optString("session_id")
+            val challengeB64 = json.optString("challenge")
+
+            require(version == 1) { "Unsupported HW_AUTH version" }
+            require(algorithm == "ECDSA-P256-HW-ATTESTATION") {
+                "Unsupported HW_AUTH algorithm"
+            }
+            require(sessionId.isNotEmpty()) { "Missing HW_AUTH session_id" }
+            require(challengeB64.isNotEmpty()) { "Missing HW_AUTH challenge" }
+
+            // Verify that the challenge is valid Base64 before signing.
+            val challenge = Base64.decode(challengeB64, Base64.DEFAULT)
+            require(challenge.size == 32) { "Invalid HW_AUTH challenge length" }
+
+            val keyInfo = securityKeyStore.getExistingWebRtcHardwareKey(context)
+
+            val message = (
+                    "LAZYPC_HW_AUTH_V1|SESSION|" +
+                            sessionId + "|" +
+                            challengeB64 + "|" +
+                            keyInfo.publicKeyBase64
+                    ).toByteArray(StandardCharsets.UTF_8)
+
+            val signature = securityKeyStore.signHardwareProof(message)
+
+            val response = JSONObject().apply {
+                put("type", "hw_auth_response")
+                put("version", 1)
+                put("algorithm", "ECDSA-P256-HW-ATTESTATION")
+                put("session_id", sessionId)
+                put("challenge", challengeB64)
+                put("hardware_public", keyInfo.publicKeyBase64)
+                put("signature", signature)
+                put(
+                    "attestation_challenge",
+                    keyInfo.attestationChallengeBase64
+                )
+                put(
+                    "attestation_chain",
+                    org.json.JSONArray(keyInfo.attestationChainBase64)
+                )
+            }
+
+            hardwareAuthPending = true
+
+            if (!sendText(response.toString())) {
+                hardwareAuthPending = false
+                throw IllegalStateException("Failed to send HW_AUTH_RESPONSE")
+            }
+
+            Log.i(
+                "LazyPC-Security",
+                "HW_AUTH_RESPONSE sent from Android Keystore hardware key"
+            )
+
+        } catch (error: Throwable) {
+            hardwareAuthPending = false
+            hardwareAuthorized = false
+            Log.e(
+                "LazyPC-Security",
+                "HW_AUTH failed",
+                error
+            )
+        }
+
+        return true
+    }
+
     private fun handleBinaryMessage(
         bytes: ByteArray
     ) {
@@ -672,7 +883,7 @@ class WebRTCClient(
 
         Log.d(
             "WEBRTC",
-            "📥 ADD REMOTE ICE: ${candidate.sdp}"
+            "📥 Remote ICE candidate received"
         )
 
         peerConnection?.addIceCandidate(
@@ -698,17 +909,7 @@ class WebRTCClient(
 
         Log.d(
             "SDP",
-            "================ OFFER ================"
-        )
-
-        Log.d(
-            "SDP",
-            sdp
-        )
-
-        Log.d(
-            "SDP",
-            "======================================="
+            "📥 Remote offer received"
         )
 
         pc.setRemoteDescription(
@@ -719,7 +920,7 @@ class WebRTCClient(
 
                     Log.d(
                         "WEBRTC",
-                        "✅ REMOTE SDP SET"
+                        "✅ Remote SDP applied"
                     )
 
                     pc.createAnswer(
@@ -732,17 +933,7 @@ class WebRTCClient(
 
                                 Log.d(
                                     "SDP",
-                                    "================ ANSWER ================"
-                                )
-
-                                Log.d(
-                                    "SDP",
-                                    answer.description
-                                )
-
-                                Log.d(
-                                    "SDP",
-                                    "========================================"
+                                    "📤 Local answer created"
                                 )
 
                                 pc.setLocalDescription(
@@ -753,7 +944,7 @@ class WebRTCClient(
 
                                             Log.d(
                                                 "WEBRTC",
-                                                "✅ LOCAL SDP SET"
+                                                "✅ Local SDP applied"
                                             )
 
                                             onAnswer(
@@ -854,6 +1045,8 @@ class WebRTCClient(
 
         statsExecutor?.shutdownNow()
         statsExecutor = null
+        trustedPairingStarted = false
+        trustedPairingInvitation = null
         diagnosticsStartedAtNs = 0L
 
         clearAudioRoute()

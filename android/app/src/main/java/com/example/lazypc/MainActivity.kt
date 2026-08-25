@@ -1,6 +1,7 @@
 package com.example.lazypc
 
 import android.os.Bundle
+import android.widget.Toast
 import android.content.ComponentName
 import android.content.ServiceConnection
 import android.os.IBinder
@@ -18,6 +19,9 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.example.lazypc.input.mouse.CursorState
 import com.example.lazypc.input.mouse.MouseEmitter
 import com.example.lazypc.input.PointerInputRouter
@@ -177,6 +181,87 @@ class MainActivity : AppCompatActivity() {
             serviceConnection,
             BIND_AUTO_CREATE
         )
+    }
+
+    private fun startTrustedDevicePairing() {
+        val service = webRtcService ?: run {
+            Toast.makeText(
+                this,
+                "WebRTC service ещё не готов",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+
+        val scanner = GmsBarcodeScanning.getClient(this, options)
+
+        scanner.startScan()
+            .addOnSuccessListener { barcode ->
+                val payload = barcode.rawValue?.trim()
+
+                if (payload.isNullOrEmpty()) {
+                    Toast.makeText(
+                        this,
+                        "QR-код пустой",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@addOnSuccessListener
+                }
+
+                try {
+                    // Parse/validate now, then arm the already implemented
+                    // Trusted Pairing flow. The WebRTC DataChannel carries
+                    // the actual PAIR_HELLO / PAIR_RESPONSE exchange.
+                    com.example.lazypc.security.TrustedPairing(
+                        this,
+                        com.example.lazypc.security.SecurityKeyStore()
+                    ).parseQrPayload(payload)
+
+                    service.connectTrustedPairingSession(payload)
+
+                    Toast.makeText(
+                        this,
+                        "Trusted Device pairing запущен",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } catch (error: Throwable) {
+                    Log.e(
+                        TAG_APP,
+                        "Trusted Device QR rejected",
+                        error
+                    )
+
+                    Toast.makeText(
+                        this,
+                        "Неверный LazyPC QR-код",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            .addOnCanceledListener {
+                Log.d(
+                    TAG_APP,
+                    "Trusted Device QR scan cancelled"
+                )
+            }
+            .addOnFailureListener { error ->
+                Log.e(
+                    TAG_APP,
+                    "Trusted Device QR scanner failed",
+                    error
+                )
+
+                Toast.makeText(
+                    this,
+                    "Не удалось открыть QR-сканер",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
     }
 
     private fun initializeFromService() {
@@ -397,6 +482,10 @@ class MainActivity : AppCompatActivity() {
 
                 onDisconnectSession = {
                     webRtcService?.disconnectSession()
+                },
+
+                onAddTrustedDevice = {
+                    startTrustedDevicePairing()
                 }
             )
         }

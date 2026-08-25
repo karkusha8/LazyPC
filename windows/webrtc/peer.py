@@ -1,8 +1,11 @@
 import asyncio
+import inspect
+import json
 import struct
 import time
 
 from typing import Callable, Optional
+
 
 from webrtc.video_track import DesktopVideoTrack
 from audio.audio_track import SystemAudioTrack
@@ -48,6 +51,10 @@ class PeerConnection:
         self.pc: Optional[RTCPeerConnection] = None
         self.video: Optional[DesktopVideoTrack] = None
         self.video_sender = None
+
+        self.audio: Optional[SystemAudioTrack] = None
+        self.audio_sender = None
+
         self.channel: Optional[RTCDataChannel] = None
 
         self.on_text: Optional[Callable[[str], None]] = None
@@ -60,6 +67,9 @@ class PeerConnection:
         self._stopping = False
         self._disconnect_task = None
         self.on_session_close = None
+        self.on_channel_open = None
+        self.on_hardware_auth_message = None
+        self.security_authorized = False
     async def start_session(self):
 
         if self.pc is not None:
@@ -91,7 +101,14 @@ class PeerConnection:
             self.audio
         )
 
-        print("[WEBRTC] VideoTrack added")
+        # Security gate: tracks are negotiated, but media is muted until
+        # Stage 3 Hardware-Bound WebRTC Authentication succeeds.
+        self.video_sender.replaceTrack(None)
+        self.audio_sender.replaceTrack(None)
+
+        self.security_authorized = False
+
+        print("[WEBRTC] VideoTrack added (media gated)")
 
         self._prefer_h264()
 
@@ -378,7 +395,7 @@ class PeerConnection:
             print("[DATA] Send skipped: transport not connected")
             return False
         except Exception as e:
-            print("[DATA] Send error:", e)
+            print("[DATA] Send error")
             return False
 
 
@@ -406,39 +423,10 @@ class PeerConnection:
             )
 
 
-            if self._safe_channel_send("PING"):
-                print("[DATA] TX -> PING")
+            print("[SECURITY] Stage 3 required before media/input")
 
-
-            # ====================================================
-            # START CURSOR SYNC
-            # ====================================================
-
-
-            if (
-
-                self._cursor_sync_task is None
-
-                or
-
-                self._cursor_sync_task.done()
-
-            ):
-
-
-                self._cursor_sync_task = (
-
-                    asyncio.create_task(
-
-                        self._cursor_sync_loop()
-                    )
-                )
-
-
-                print(
-
-                    "[CURSOR] Sync started"
-                )
+            if self.on_channel_open is not None:
+                self.on_channel_open()
 
 
         @channel.on(
@@ -500,11 +488,21 @@ class PeerConnection:
             )
 
 
-            print(
+            print("[DATA] Text message received")
 
-                f"[DATA] RX -> {text}"
-            )
 
+            try:
+                control = json.loads(text)
+            except Exception:
+                control = None
+
+            if (
+                isinstance(control, dict)
+                and str(control.get("type", "")).startswith("hw_auth_")
+            ):
+                if self.on_hardware_auth_message is not None:
+                    self.on_hardware_auth_message(text)
+                return
 
             if text == "SESSION_CLOSE":
                 print("[WEBRTC] Remote requested session close")
@@ -517,11 +515,10 @@ class PeerConnection:
                     print("[DATA] TX -> PONG")
 
             if self.on_text:
+                result = self.on_text(text)
 
-
-                self.on_text(
-                    text
-                )
+                if inspect.isawaitable(result):
+                    asyncio.create_task(result)
 
 
     # ================================================================
@@ -550,6 +547,9 @@ class PeerConnection:
                     1.0 / 60.0
                 )
 
+
+                if not self.security_authorized:
+                    continue
 
                 if (
 
@@ -667,6 +667,51 @@ class PeerConnection:
 
 
     # ================================================================
+    # STAGE 3 SECURITY GATE
+    # ================================================================
+
+    def authorize_hardware_session(self):
+        if self.pc is None:
+            raise RuntimeError("Cannot authorize without PeerConnection")
+
+        if self.video_sender is not None and self.video is not None:
+            self.video_sender.replaceTrack(self.video)
+
+        if self.audio_sender is not None and self.audio is not None:
+            self.audio_sender.replaceTrack(self.audio)
+
+        self.security_authorized = True
+        print("[SECURITY] Stage 3 PASS -> media/input gate opened")
+
+        if (
+            self._cursor_sync_task is None
+            or self._cursor_sync_task.done()
+        ):
+            self._cursor_sync_task = asyncio.create_task(
+                self._cursor_sync_loop()
+            )
+            print("[CURSOR] Sync started after Stage 3")
+
+    def revoke_hardware_session(self):
+        self.security_authorized = False
+
+        if self.video_sender is not None:
+            self.video_sender.replaceTrack(None)
+
+        if self.audio_sender is not None:
+            self.audio_sender.replaceTrack(None)
+
+        if (
+            self._cursor_sync_task is not None
+            and not self._cursor_sync_task.done()
+        ):
+            self._cursor_sync_task.cancel()
+
+        self._cursor_sync_task = None
+        print("[SECURITY] Stage 3 revoked -> media/input gate closed")
+
+
+    # ================================================================
     # CREATE OFFER
     # ================================================================
 
@@ -713,12 +758,7 @@ class PeerConnection:
             offer
         )
 
-        print("=" * 80)
-        print("LOCAL OFFER SDP")
-        print("=" * 80)
-        print(self.pc.localDescription.sdp)
-        print("=" * 80)
-
+        print("[WEBRTC] Local offer created")
         if "H264" in self.pc.localDescription.sdp:
 
             print("[WEBRTC] H264 present in Offer SDP")
@@ -793,26 +833,7 @@ class PeerConnection:
     ):
 
 
-        print(
-            "=" * 80
-        )
-
-        print(
-            "ANSWER SDP"
-        )
-
-        print(
-            "=" * 80
-        )
-
-        print(
-            sdp
-        )
-
-        print(
-            "=" * 80
-        )
-
+        print("[WEBRTC] Remote answer received")
 
         await self.pc.setRemoteDescription(
 
@@ -889,7 +910,7 @@ class PeerConnection:
         elif message_type == "candidate":
 
             print(
-                "[ICE] Candidate received"
+                "[ICE] Remote candidate received"
             )
 
 
@@ -936,6 +957,7 @@ class PeerConnection:
             return
 
         self._stopping = True
+        self.security_authorized = False
         self._cancel_disconnect_watch()
 
         print("[WEBRTC] Stopping session")
@@ -980,7 +1002,7 @@ class PeerConnection:
                 )
 
         except Exception as e:
-            print("[DATA] channel.close error:", e)
+            print("[DATA] channel.close error")
 
         # ================================================================
         # CLOSE WEBRTC FIRST
@@ -1001,7 +1023,7 @@ class PeerConnection:
             )
 
         except Exception as e:
-            print("[DEBUG] pc.close exception:", e)
+            print("[DEBUG] pc.close exception")
 
         # ================================================================
         # NOW TRACKS ARE NO LONGER USED BY WEBRTC
@@ -1025,7 +1047,7 @@ class PeerConnection:
                 )
 
         except Exception as e:
-            print("[VIDEO] Stop error:", e)
+            print("[VIDEO] Stop error")
 
         # ------------------------------------------------
         # AUDIO CAPTURE
@@ -1045,7 +1067,7 @@ class PeerConnection:
                 )
 
         except Exception as e:
-            print("[AUDIO] close_capture error:", e)
+            print("[AUDIO] close_capture error")
 
         # ================================================================
         # DESTROY SESSION

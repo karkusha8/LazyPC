@@ -53,7 +53,8 @@ fun RootScreen(
     sessionConnecting: Boolean,
     sessionConnected: Boolean,
     onConnectSession: () -> Unit,
-    onDisconnectSession: () -> Unit
+    onDisconnectSession: () -> Unit,
+    onAddTrustedDevice: () -> Unit
 ) {
     var keyboardVisible by remember { mutableStateOf(false) }
     var dragModeEnabled by remember { mutableStateOf(false) }
@@ -224,6 +225,21 @@ fun RootScreen(
                     },
                 keyboardEngine = keyboardEngine,
                 keyboardEmitter = keyboardEmitter
+            )
+        }
+
+        Button(
+            onClick = onAddTrustedDevice,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp),
+            colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF202020)
+            )
+        ) {
+            Text(
+                text = "ДОБАВИТЬ ДОВЕРЕННОЕ УСТРОЙСТВО",
+                color = Color.White
             )
         }
 
