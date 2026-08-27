@@ -111,6 +111,8 @@ Mouse movement is also restricted to the currently visible part of the remote de
 - [x] Basic keyboard shortcuts
 - [x] Audio streaming
 - [x] Connection status indicator
+- [x] Trusted Device pairing and storage
+- [x] Direct connection by PC ID
 
 ### Planned
 

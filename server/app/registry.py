@@ -1,6 +1,3 @@
-
-
-
 import asyncio
 import hashlib
 import json
@@ -210,6 +207,25 @@ class ConnectionRegistry:
                     return pc_id
 
         return None
+
+    async def is_pc_online(
+        self,
+        public_code: str,
+    ) -> bool:
+        """Return whether the public PC code currently has a live Agent."""
+        value = public_code.strip()
+
+        if (
+            len(value) != 9
+            or not value.isdigit()
+        ):
+            return False
+
+        async with self._lock:
+            return any(
+                self.public_pc_code(pc_id) == value
+                for pc_id in self._state.agents
+            )
 
     async def public_code_for_pc(
         self,

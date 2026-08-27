@@ -53,6 +53,7 @@ class WebRTCForegroundService : Service() {
     private var onSessionState: ((Boolean, Boolean) -> Unit)? = null
     private var onTrustedPcPaired: ((String) -> Unit)? = null
     private var onDirectSessionState: ((Boolean, Boolean, String?) -> Unit)? = null
+    private var onPcStatus: ((String, Boolean) -> Unit)? = null
 
     private var sessionConnecting = false
     private var sessionConnected = false
@@ -185,6 +186,10 @@ class WebRTCForegroundService : Service() {
 
         ws.setOnTextMessage { text ->
             handleSignalingMessage(text)
+        }
+
+        ws.setOnPcStatus { pcCode, online ->
+            onPcStatus?.invoke(pcCode, online)
         }
 
         webrtc = WebRTCClient(
@@ -342,6 +347,22 @@ class WebRTCForegroundService : Service() {
         callback: (String) -> Unit
     ) {
         onTrustedPcPaired = callback
+    }
+
+    fun registerPcStatusCallback(
+        callback: (String, Boolean) -> Unit
+    ) {
+        onPcStatus = callback
+        ws.setOnPcStatus(callback)
+    }
+
+    fun requestPcStatus(pcCode: String): Boolean {
+        if (!ws.isSignalingReady()) {
+            ws.connect()
+            return false
+        }
+
+        return ws.requestPcStatus(pcCode)
     }
 
     fun registerDirectConnectionCallback(
@@ -1205,6 +1226,34 @@ class WebRTCForegroundService : Service() {
                  * EXISTING WEBRTC SIGNALING
                  * ---------------------------------------------------------
                  */
+
+                "connection_auth_rejected" -> {
+                    val reason = json.optString(
+                        "reason",
+                        "unknown"
+                    )
+
+                    val userMessage =
+                        when (reason) {
+                            "user_declined" ->
+                                "Подключение отклонено на компьютере"
+
+                            "authentication_failed" ->
+                                "Ошибка авторизации"
+
+                            else ->
+                                "Подключение отклонено"
+                        }
+
+                    Log.e(
+                        TAG,
+                        "❌ Direct connection rejected: $reason"
+                    )
+
+                    failDirectConnection(
+                        userMessage
+                    )
+                }
 
                 "offer" -> {
 

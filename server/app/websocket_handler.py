@@ -271,6 +271,54 @@ async def _handle_find_pc(
     )
 
 
+async def _handle_pc_status(
+    ws: WebSocket,
+    message: dict,
+) -> None:
+    """Return the current online/offline state for a public PC code."""
+    requested_code = message.get("pc_code")
+
+    if (
+        not isinstance(requested_code, str)
+        or not requested_code.strip()
+    ):
+        await safe_send_text(
+            ws,
+            json.dumps({
+                "type": "pc_status",
+                "version": 1,
+                "pc_code": "",
+                "online": False,
+                "reason": "invalid_pc_code",
+            }),
+        )
+        return
+
+    requested_code = requested_code.strip()
+    lookup_code = "".join(
+        character
+        for character in requested_code
+        if character.isdigit()
+    )
+
+    online = await registry.is_pc_online(lookup_code)
+
+    await safe_send_text(
+        ws,
+        json.dumps({
+            "type": "pc_status",
+            "version": 1,
+            "pc_code": lookup_code,
+            "online": online,
+        }),
+    )
+
+    print(
+        f"📡 PC status: {lookup_code} -> "
+        f"{'ONLINE' if online else 'OFFLINE'}"
+    )
+
+
 async def _handle_connect_trusted(
     ws: WebSocket,
     message: dict,
@@ -416,6 +464,7 @@ async def handle_connection(ws: WebSocket):
                 and _parse_json(first).get("type") in {
                     "find_pc",
                     "connect_trusted",
+                    "get_pc_status",
                 }
             )
         ):
@@ -428,6 +477,7 @@ async def handle_connection(ws: WebSocket):
                 and first_json.get("type") in {
                     "find_pc",
                     "connect_trusted",
+                    "get_pc_status",
                 }
             ):
                 handshake_first = "HELLO_CLIENT"
@@ -515,6 +565,13 @@ async def handle_connection(ws: WebSocket):
 
                 if message_type == "connect_trusted":
                     await _handle_connect_trusted(
+                        ws,
+                        message,
+                    )
+                    continue
+
+                if message_type == "get_pc_status":
+                    await _handle_pc_status(
                         ws,
                         message,
                     )

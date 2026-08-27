@@ -27,6 +27,7 @@ class WsClient(
 
     private var onText: ((String) -> Unit)? = null
     private var onConnectionState: ((Boolean) -> Unit)? = null
+    private var onPcStatus: ((String, Boolean) -> Unit)? = null
 
     private val securityKeyStore = SecurityKeyStore()
 
@@ -36,6 +37,10 @@ class WsClient(
 
     fun setOnConnectionState(callback: (Boolean) -> Unit) {
         onConnectionState = callback
+    }
+
+    fun setOnPcStatus(callback: (String, Boolean) -> Unit) {
+        onPcStatus = callback
     }
 
     @Synchronized
@@ -162,6 +167,37 @@ class WsClient(
             "LazyPC-Security",
             "📤 find_pc sent: $formatted"
         )
+
+        return sendText(json.toString())
+    }
+
+    /**
+     * Ask signaling whether a concrete public PC code currently has
+     * a connected Windows Agent.
+     */
+    fun requestPcStatus(pcCode: String): Boolean {
+        if (!isSignalingReady()) {
+            Log.e(
+                "LazyPC-Security",
+                "❌ get_pc_status blocked: signaling handshake is not ready"
+            )
+            return false
+        }
+
+        val normalized = pcCode.filter { it.isDigit() }
+
+        if (normalized.length != 9) {
+            Log.e(
+                "LazyPC-Security",
+                "Invalid PC code for status: expected 9 digits"
+            )
+            return false
+        }
+
+        val json = JSONObject().apply {
+            put("type", "get_pc_status")
+            put("pc_code", normalized)
+        }
 
         return sendText(json.toString())
     }
@@ -640,6 +676,17 @@ class WsClient(
                     val json = JSONObject(text)
 
                     when (json.optString("type")) {
+                        "pc_status" -> {
+                            val pcCode = json.optString("pc_code")
+                            val online = json.optBoolean("online", false)
+
+                            if (pcCode.isNotBlank()) {
+                                onPcStatus?.invoke(pcCode, online)
+                            }
+
+                            return
+                        }
+
                         /*
                          * Old Trusted Device model.
                          */

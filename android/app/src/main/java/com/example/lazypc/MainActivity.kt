@@ -1,6 +1,8 @@
 package com.example.lazypc
 
-import RootScreen
+import com.example.lazypc.ui.screens.HomeScreen
+import com.example.lazypc.ui.screens.ConnectByIdScreen
+import com.example.lazypc.ui.screens.RemoteSessionScreen
 import android.os.Bundle
 import android.widget.Toast
 import android.content.ComponentName
@@ -58,6 +60,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var trustedPcStore: TrustedPcStore
     private var trustedPcs by mutableStateOf<List<TrustedPc>>(emptyList())
+    private var pcOnline by mutableStateOf<Map<String, Boolean>>(emptyMap())
 
     private lateinit var renderer: CustomVideoRenderer
 
@@ -131,7 +134,28 @@ class MainActivity : AppCompatActivity() {
     private var simpleConnectionConnected by mutableStateOf(false)
     private var simpleConnectionError by mutableStateOf<String?>(null)
 
+    private var connectionState by mutableStateOf<ConnectionState>(
+        ConnectionState.Disconnected
+    )
+
+    // True while the user is on the one-time "Connect by ID" screen.
+    // It is intentionally not persisted.
+    private var showConnectById by mutableStateOf(false)
+
     private val lifecycleHandler = Handler(Looper.getMainLooper())
+
+    private val pcStatusPoll = object : Runnable {
+        override fun run() {
+            if (!finishing && !sessionConnected && !simpleConnectionConnected) {
+                trustedPcs.forEach { pc ->
+                    webRtcService?.requestPcStatus(pc.pcCode)
+                }
+
+                lifecycleHandler.postDelayed(this, 10_000L)
+            }
+        }
+    }
+
     private var recoveryScheduled = false
     private var recoveryInProgress = false
     private var finishing = false
@@ -150,11 +174,15 @@ class MainActivity : AppCompatActivity() {
 
             Log.d(TAG_APP, "🟢 WEBRTC SERVICE BOUND")
             initializeFromService()
+
+            lifecycleHandler.removeCallbacks(pcStatusPoll)
+            lifecycleHandler.post(pcStatusPoll)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             serviceBound = false
             webRtcService = null
+            connectionState = ConnectionState.Disconnected
             Log.w(TAG_APP, "🔴 WEBRTC SERVICE DISCONNECTED")
         }
     }
@@ -397,137 +425,135 @@ class MainActivity : AppCompatActivity() {
         keyboardEmitter = KeyboardEmitter(webrtc)
 
         setContent {
-            RootScreen(
-                eglContext = eglContext,
+            if (sessionConnected || simpleConnectionConnected) {
+                RemoteSessionScreen(
+                    eglContext = eglContext,
+                    videoWidth = detectedVideoWidth,
+                    videoHeight = detectedVideoHeight,
 
-                videoWidth = detectedVideoWidth,
-                videoHeight = detectedVideoHeight,
+                    onSurfaceCreated = { surface ->
+                        if (::renderer.isInitialized) {
+                            currentVideoTrack?.removeSink(renderer)
+                        }
 
-                onSurfaceCreated = { surface ->
-                    if (::renderer.isInitialized) {
-                        currentVideoTrack
-                            ?.removeSink(renderer)
+                        renderer = surface
+                        currentVideoTrack?.addSink(renderer)
+                        currentVideoTrack?.addSink(videoSizeSink)
+                    },
+
+                    onTouch = { event ->
+                        pointerInputRouter.onTouch(event)
+                    },
+
+                    cursorState = cursorState,
+
+                    onMouseAreaSizeChanged = { width, height ->
+                        mouseAreaWidth = width
+                        mouseAreaHeight = height
+                    },
+
+                    onVideoAreaSizeChanged = { width, height ->
+                        videoAreaWidth = width
+                        videoAreaHeight = height
+
+                        mouseActionMinX = 0f
+                        mouseActionMaxX = width
+                        mouseActionMinY = 0f
+                        mouseActionMaxY = height
+
+                        cursorState.initialize(width, height)
+                    },
+
+                    onRecenterMouse = { targetX, targetY ->
+                        val dx = targetX - cursorState.x
+                        val dy = targetY - cursorState.y
+
+                        if (dx != 0f || dy != 0f) {
+                            mouseEmitter.sendMove(dx, dy)
+
+                            cursorState.move(
+                                dx = dx,
+                                dy = dy,
+                                width = videoAreaWidth,
+                                height = videoAreaHeight
+                            )
+                        }
+                    },
+
+                    onMouseActionBoundsChanged = { minX, maxX, minY, maxY ->
+                        mouseActionMinX = minX
+                        mouseActionMaxX = maxX
+                        mouseActionMinY = minY
+                        mouseActionMaxY = maxY
+                    },
+
+                    keyboardEngine = keyboardEngine,
+                    keyboardEmitter = keyboardEmitter,
+
+                    onDragModeChanged = { enabled ->
+                        dragModeEnabled = enabled
+                        Log.d(TAG_INPUT, "🧲 Drag mode = $enabled")
+                    },
+
+                    onDisconnect = {
+                        connectionState = ConnectionState.Disconnecting
+
+                        if (simpleConnectionConnected) {
+                            webRtcService?.disconnectToPc()
+                        } else {
+                            webRtcService?.disconnectSession()
+                        }
+
+                        connectionState = ConnectionState.Disconnected
+                    })
+            } else if (showConnectById) {
+                ConnectByIdScreen(
+                    connecting = simpleConnectionConnecting,
+                    connected = simpleConnectionConnected,
+                    error = simpleConnectionError,
+
+                    onConnect = { pcId ->
+                        simpleConnectionError = null
+                        connectionState = ConnectionState.Connecting
+                        webRtcService?.connectToPc(pcId)
+                    },
+
+                    onBack = {
+                        if (!simpleConnectionConnecting) {
+                            showConnectById = false
+                            simpleConnectionError = null
+                            connectionState = ConnectionState.Disconnected
+                        }
                     }
+                )
+            } else {
+                HomeScreen(
+                    trustedPcs = trustedPcs,
+                    pcOnline = pcOnline,
 
-                    renderer = surface
+                    onComputerClick = { pc ->
+                        connectionState = ConnectionState.Connecting
+                        webRtcService?.connectTrusted(pc.pcCode)
+                    },
 
-                    currentVideoTrack
-                        ?.addSink(renderer)
+                    onAddComputer = {
+                        startTrustedDevicePairing()
+                    },
 
-                    currentVideoTrack
-                        ?.addSink(videoSizeSink)
-                },
+                    onConnectById = {
+                        simpleConnectionError = null
+                        showConnectById = true
+                    },
 
-                onTouch = { event ->
-                    pointerInputRouter.onTouch(event)
-                },
-
-                cursorState = cursorState,
-
-                onMouseAreaSizeChanged = {
-                        width,
-                        height ->
-                    mouseAreaWidth = width
-                    mouseAreaHeight = height
-                },
-
-                onVideoAreaSizeChanged = {
-                        width,
-                        height ->
-                    videoAreaWidth = width
-                    videoAreaHeight = height
-
-                    mouseActionMinX = 0f
-                    mouseActionMaxX = width
-                    mouseActionMinY = 0f
-                    mouseActionMaxY = height
-
-                    cursorState.initialize(
-                        width,
-                        height
-                    )
-                },
-
-                onRecenterMouse = { targetX, targetY ->
-                    val dx = targetX - cursorState.x
-                    val dy = targetY - cursorState.y
-
-                    if (dx != 0f || dy != 0f) {
-                        mouseEmitter.sendMove(dx, dy)
-
-                        cursorState.move(
-                            dx = dx,
-                            dy = dy,
-                            width = videoAreaWidth,
-                            height = videoAreaHeight
-                        )
+                    onSettingsClick = {
+                        Toast.makeText(
+                            this,
+                            "Настройки пока в разработке",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
-                },
-
-                onMouseActionBoundsChanged = {
-                        minX,
-                        maxX,
-                        minY,
-                        maxY ->
-                    mouseActionMinX = minX
-                    mouseActionMaxX = maxX
-                    mouseActionMinY = minY
-                    mouseActionMaxY = maxY
-                },
-
-                keyboardEngine = keyboardEngine,
-                keyboardEmitter = keyboardEmitter,
-
-                onDragModeChanged = { enabled ->
-                    dragModeEnabled = enabled
-
-                    Log.d(
-                        TAG_INPUT,
-                        "🧲 Drag mode = $enabled"
-                    )
-                },
-
-                sessionConnecting = sessionConnecting,
-                sessionConnected = sessionConnected,
-
-                onConnectSession = {
-                    webRtcService?.connectSession()
-                },
-
-                onDisconnectSession = {
-                    webRtcService?.disconnectSession()
-                },
-
-                onAddTrustedDevice = {
-                    startTrustedDevicePairing()
-                },
-
-                trustedPcs = trustedPcs,
-                onConnectTrustedPc = { pc ->
-                    webRtcService?.connectTrusted(pc.pcCode)
-                },
-                onRemoveTrustedPc = { pc ->
-                    trustedPcStore.remove(pc.pcCode)
-                    trustedPcs = trustedPcStore.list()
-                },
-
-                onConnectToPc = { pcId ->
-                    webRtcService?.connectToPc(pcId)
-                },
-
-                onDisconnectToPc = {
-                    webRtcService?.disconnectToPc()
-                },
-
-                simpleConnectionConnecting =
-                    simpleConnectionConnecting,
-
-                simpleConnectionConnected =
-                    simpleConnectionConnected,
-
-                simpleConnectionError =
-                    simpleConnectionError
-            )
+                )
+            }
         }
 
         service.registerUiCallbacks(
@@ -580,6 +606,13 @@ class MainActivity : AppCompatActivity() {
             onSessionState = { connecting, connected ->
                 sessionConnecting = connecting
                 sessionConnected = connected
+
+                connectionState =
+                    when {
+                        connected -> ConnectionState.Connected
+                        connecting -> ConnectionState.Connecting
+                        else -> ConnectionState.Disconnected
+                    }
             }
         )
 
@@ -595,6 +628,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        service.registerPcStatusCallback { pcCode, online ->
+            runOnUiThread {
+                pcOnline = pcOnline + (pcCode to online)
+            }
+        }
+
         service.registerDirectConnectionCallback {
                 connecting,
                 connected,
@@ -603,6 +642,14 @@ class MainActivity : AppCompatActivity() {
                 simpleConnectionConnecting = connecting
                 simpleConnectionConnected = connected
                 simpleConnectionError = error
+
+                connectionState =
+                    when {
+                        connected -> ConnectionState.Connected
+                        connecting -> ConnectionState.Connecting
+                        error != null -> ConnectionState.Error(error)
+                        else -> ConnectionState.Disconnected
+                    }
             }
         }
     }
@@ -617,6 +664,11 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG_APP, "▶ APP RESUMED")
+
+        if (!sessionConnected && !simpleConnectionConnected) {
+            lifecycleHandler.removeCallbacks(pcStatusPoll)
+            lifecycleHandler.post(pcStatusPoll)
+        }
 
         if (::renderer.isInitialized) {
             currentVideoTrack?.addSink(renderer)
