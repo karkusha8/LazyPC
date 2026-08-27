@@ -1,4 +1,4 @@
-package com.example.lazypc.ui.screens
+
 
 import android.content.res.Configuration
 import android.view.MotionEvent
@@ -8,6 +8,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -31,6 +32,7 @@ import com.example.lazypc.ui.components.BottomToolbar
 import com.example.lazypc.video.CustomVideoRenderer
 import com.example.lazypc.video.ScreenViewport
 import com.example.lazypc.video.VideoGestureController
+import com.example.lazypc.security.TrustedPc
 import org.webrtc.EglBase
 import kotlin.math.roundToInt
 
@@ -54,11 +56,25 @@ fun RootScreen(
     sessionConnected: Boolean,
     onConnectSession: () -> Unit,
     onDisconnectSession: () -> Unit,
-    onAddTrustedDevice: () -> Unit
+    onAddTrustedDevice: () -> Unit,
+
+    trustedPcs: List<TrustedPc> = emptyList(),
+    onConnectTrustedPc: (TrustedPc) -> Unit = {},
+    onRemoveTrustedPc: (TrustedPc) -> Unit = {},
+
+    // New simplified connection model.
+    // Wiring these callbacks to the service comes next.
+    onConnectToPc: (String) -> Unit = {},
+    onDisconnectToPc: () -> Unit = {},
+    simpleConnectionConnecting: Boolean = false,
+    simpleConnectionConnected: Boolean = false,
+    simpleConnectionError: String? = null
 ) {
     var keyboardVisible by remember { mutableStateOf(false) }
     var dragModeEnabled by remember { mutableStateOf(false) }
     var panModeActive by remember { mutableStateOf(false) }
+
+    var pcIdInput by remember { mutableStateOf("") }
 
     val viewport = remember { ScreenViewport() }
 
@@ -92,11 +108,6 @@ fun RootScreen(
         }
     }
 
-    /*
-     * Current valid mouse-action area in fitted-video coordinates.
-     * At 1x it is the whole fitted video. When zoomed, it becomes only
-     * the part of the source that is currently visible inside the fixed Box.
-     */
     LaunchedEffect(
         viewport.scale,
         viewport.offsetX,
@@ -206,11 +217,38 @@ fun RootScreen(
             )
         }
 
-        SessionControl(
+        /*
+         * SECOND CONNECTION MODEL
+         *
+         * This UI is deliberately independent from SessionControl below.
+         * It does not replace or alter the existing connection model.
+         */
+        SimplePcConnectionControl(
+            pcId = pcIdInput,
+            onPcIdChanged = {
+                // Keep only the ID itself here. Validation belongs to the
+                // service/network layer.
+                pcIdInput = it
+            },
+            connecting = simpleConnectionConnecting,
+            connected = simpleConnectionConnected,
+            error = simpleConnectionError,
+            onConnect = {
+                val normalized = pcIdInput.trim()
+                if (normalized.isNotEmpty()) {
+                    onConnectToPc(normalized)
+                }
+            },
+            onDisconnect = onDisconnectToPc
+        )
+
+        TrustedPcConnectionControl(
+            devices = trustedPcs,
             connecting = sessionConnecting,
             connected = sessionConnected,
-            onConnect = onConnectSession,
-            onDisconnect = onDisconnectSession
+            onConnect = onConnectTrustedPc,
+            onDisconnect = onDisconnectSession,
+            onRemove = onRemoveTrustedPc
         )
 
         if (keyboardVisible) {
@@ -254,6 +292,212 @@ fun RootScreen(
                 onDragModeChanged(dragModeEnabled)
             }
         )
+    }
+}
+
+@Composable
+private fun TrustedPcConnectionControl(
+    devices: List<TrustedPc>,
+    connecting: Boolean,
+    connected: Boolean,
+    onConnect: (TrustedPc) -> Unit,
+    onDisconnect: () -> Unit,
+    onRemove: (TrustedPc) -> Unit
+) {
+    var selected by remember(devices) {
+        mutableStateOf(devices.firstOrNull())
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color.Black)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "ДОВЕРЕННЫЕ КОМПЬЮТЕРЫ",
+            color = Color.White,
+            modifier = Modifier.padding(bottom = 6.dp)
+        )
+
+        if (devices.isEmpty()) {
+            Text(
+                text = "Нет сопряжённых компьютеров",
+                color = Color(0xFFAAAAAA),
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+        } else {
+            devices.forEach { pc ->
+                val isSelected = selected?.pcCode == pc.pcCode
+                Button(
+                    onClick = { selected = pc },
+                    enabled = !connecting && !connected,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 2.dp),
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                        containerColor = if (isSelected) Color(0xFF303030) else Color(0xFF181818),
+                        disabledContainerColor = if (isSelected) Color(0xFF303030) else Color(0xFF181818)
+                    )
+                ) {
+                    Text(
+                        text = "${if (isSelected) "●" else "○"}  ${pc.name}\n${formatPcCode(pc.pcCode)}",
+                        color = Color.White
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(6.dp))
+
+        Button(
+            onClick = {
+                if (connected) onDisconnect()
+                else selected?.let(onConnect)
+            },
+            enabled = connected || (!connecting && selected != null),
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                containerColor = if (connected) Color(0xFF8B1E1E) else Color(0xFF2C2C2C),
+                disabledContainerColor = Color(0xFF202020)
+            )
+        ) {
+            Text(
+                text = when {
+                    connected -> "ОТКЛЮЧИТЬСЯ"
+                    connecting -> "ПОДКЛЮЧЕНИЕ..."
+                    else -> "ПОДКЛЮЧИТЬСЯ"
+                },
+                color = Color.White
+            )
+        }
+
+        if (selected != null && !connecting && !connected) {
+            Button(
+                onClick = { selected?.let(onRemove); selected = null },
+                modifier = Modifier.fillMaxWidth().height(40.dp),
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF202020)
+                )
+            ) {
+                Text("УДАЛИТЬ ВЫБРАННЫЙ ПК", color = Color(0xFFFF8080))
+            }
+        }
+    }
+}
+
+private fun formatPcCode(code: String): String {
+    val normalized = code.filter { it.isDigit() }
+    return if (normalized.length == 9) {
+        "${normalized.substring(0, 3)} ${normalized.substring(3, 6)} ${normalized.substring(6, 9)}"
+    } else normalized
+}
+
+/**
+ * New simplified connection UI.
+ *
+ * It only collects a PC ID and invokes onConnectToPc().
+ * Actual WebSocket/registry/WebRTC wiring is intentionally not here.
+ */
+@Composable
+private fun SimplePcConnectionControl(
+    pcId: String,
+    onPcIdChanged: (String) -> Unit,
+    connecting: Boolean,
+    connected: Boolean,
+    error: String?,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color.Black)
+            .padding(
+                horizontal = 12.dp,
+                vertical = 6.dp
+            ),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        OutlinedTextField(
+            value = pcId,
+            onValueChange = onPcIdChanged,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            enabled = !connecting && !connected,
+            label = {
+                Text("ID компьютера")
+            },
+            placeholder = {
+                Text("Например: lazypc-123456")
+            },
+            supportingText = {
+                when {
+                    error != null -> {
+                        Text(
+                            text = error,
+                            color = Color(0xFFFF6B6B)
+                        )
+                    }
+
+                    connected -> {
+                        Text(
+                            text = "Подключено",
+                            color = Color(0xFF66BB6A)
+                        )
+                    }
+
+                    connecting -> {
+                        Text(
+                            text = "Поиск компьютера..."
+                        )
+                    }
+                }
+            },
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                disabledTextColor = Color.White,
+                focusedBorderColor = Color.White,
+                unfocusedBorderColor = Color(0xFF666666),
+                disabledBorderColor = Color(0xFF444444),
+                focusedLabelColor = Color.White,
+                unfocusedLabelColor = Color(0xFFAAAAAA),
+                disabledLabelColor = Color(0xFF888888),
+                cursorColor = Color.White
+            )
+        )
+
+        Spacer(Modifier.height(6.dp))
+
+        Button(
+            onClick = {
+                if (connected) {
+                    onDisconnect()
+                } else {
+                    onConnect()
+                }
+            },
+            enabled = connected ||
+                    (pcId.trim().isNotEmpty() && !connecting),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp),
+            colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                containerColor = if (connected) Color(0xFF8B1E1E) else Color(0xFF2C2C2C),
+                disabledContainerColor = Color(0xFF202020)
+            )
+        ) {
+            Text(
+                text = when {
+                    connected -> "ОТКЛЮЧИТЬСЯ"
+                    connecting -> "ПОИСК КОМПЬЮТЕРА..."
+                    else -> "ПОДКЛЮЧИТЬСЯ"
+                },
+                color = Color.White
+            )
+        }
     }
 }
 
@@ -355,16 +599,6 @@ private fun PanModeOverlay(
     }
 }
 
-/**
- * The Compose viewport is fixed.
- *
- * The outer screen area fills the available space.
- * The fitted video Box has a fixed layout size.
- * Zoom/pan are applied only through CustomVideoRenderer.setContentTransform().
- *
- * The fitted video Box is clipped so a transformed TextureView can never
- * visually enlarge the box itself.
- */
 @Composable
 private fun VideoViewport(
     viewport: ScreenViewport,
@@ -465,13 +699,6 @@ private fun LocalCursor(
     ) {
         val s = cursorScale
 
-        /*
-         * CursorState stores the real mouse position in the original
-         * fitted-video coordinate system.
-         *
-         * The video content is transformed around the center of the
-         * fixed video Box. Apply the exact same transform to the cursor.
-         */
         val boxWidth = viewport.fittedWidth
         val boxHeight = viewport.fittedHeight
 

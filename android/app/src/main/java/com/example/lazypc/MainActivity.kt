@@ -1,5 +1,6 @@
 package com.example.lazypc
 
+import RootScreen
 import android.os.Bundle
 import android.widget.Toast
 import android.content.ComponentName
@@ -31,9 +32,12 @@ import com.example.lazypc.input.keyboard.core.ActionResolver
 import com.example.lazypc.input.keyboard.core.KeyboardEngine
 import com.example.lazypc.input.keyboard.emit.KeyboardEmitter
 import com.example.lazypc.input.keyboard.mapping.LanguageEN
-import com.example.lazypc.ui.screens.RootScreen
+import com.example.lazypc.security.SecurityKeyStore
+import com.example.lazypc.security.TrustedPairing
 import com.example.lazypc.video.CustomVideoRenderer
 import com.example.lazypc.service.WebRTCForegroundService
+import com.example.lazypc.security.TrustedPc
+import com.example.lazypc.security.TrustedPcStore
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
 import org.webrtc.VideoTrack
@@ -51,6 +55,9 @@ class MainActivity : AppCompatActivity() {
 
     private var webRtcService: WebRTCForegroundService? = null
     private var serviceBound = false
+
+    private lateinit var trustedPcStore: TrustedPcStore
+    private var trustedPcs by mutableStateOf<List<TrustedPc>>(emptyList())
 
     private lateinit var renderer: CustomVideoRenderer
 
@@ -120,6 +127,10 @@ class MainActivity : AppCompatActivity() {
     private var sessionConnecting by mutableStateOf(false)
     private var sessionConnected by mutableStateOf(false)
 
+    private var simpleConnectionConnecting by mutableStateOf(false)
+    private var simpleConnectionConnected by mutableStateOf(false)
+    private var simpleConnectionError by mutableStateOf<String?>(null)
+
     private val lifecycleHandler = Handler(Looper.getMainLooper())
     private var recoveryScheduled = false
     private var recoveryInProgress = false
@@ -167,6 +178,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         Log.d(TAG_APP, "🚀 LAZYPC START")
+
+        trustedPcStore = TrustedPcStore(this)
+        trustedPcs = trustedPcStore.list()
 
         val serviceIntent =
             Intent(this, WebRTCForegroundService::class.java)
@@ -217,9 +231,9 @@ class MainActivity : AppCompatActivity() {
                     // Parse/validate now, then arm the already implemented
                     // Trusted Pairing flow. The WebRTC DataChannel carries
                     // the actual PAIR_HELLO / PAIR_RESPONSE exchange.
-                    com.example.lazypc.security.TrustedPairing(
+                    TrustedPairing(
                         this,
-                        com.example.lazypc.security.SecurityKeyStore()
+                        SecurityKeyStore()
                     ).parseQrPayload(payload)
 
                     service.connectTrustedPairingSession(payload)
@@ -486,7 +500,33 @@ class MainActivity : AppCompatActivity() {
 
                 onAddTrustedDevice = {
                     startTrustedDevicePairing()
-                }
+                },
+
+                trustedPcs = trustedPcs,
+                onConnectTrustedPc = { pc ->
+                    webRtcService?.connectTrusted(pc.pcCode)
+                },
+                onRemoveTrustedPc = { pc ->
+                    trustedPcStore.remove(pc.pcCode)
+                    trustedPcs = trustedPcStore.list()
+                },
+
+                onConnectToPc = { pcId ->
+                    webRtcService?.connectToPc(pcId)
+                },
+
+                onDisconnectToPc = {
+                    webRtcService?.disconnectToPc()
+                },
+
+                simpleConnectionConnecting =
+                    simpleConnectionConnecting,
+
+                simpleConnectionConnected =
+                    simpleConnectionConnected,
+
+                simpleConnectionError =
+                    simpleConnectionError
             )
         }
 
@@ -542,6 +582,29 @@ class MainActivity : AppCompatActivity() {
                 sessionConnected = connected
             }
         )
+
+        service.registerTrustedPcPairedCallback { pcCode ->
+            runOnUiThread {
+                trustedPcStore.addOrUpdate(pcCode)
+                trustedPcs = trustedPcStore.list()
+                Toast.makeText(
+                    this,
+                    "Компьютер добавлен в доверенные",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+
+        service.registerDirectConnectionCallback {
+                connecting,
+                connected,
+                error ->
+            runOnUiThread {
+                simpleConnectionConnecting = connecting
+                simpleConnectionConnected = connected
+                simpleConnectionError = error
+            }
+        }
     }
 
     override fun onPause() {

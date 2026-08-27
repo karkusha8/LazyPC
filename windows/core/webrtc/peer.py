@@ -7,8 +7,8 @@ import time
 from typing import Callable, Optional
 
 
-from webrtc.video_track import DesktopVideoTrack
-from audio.audio_track import SystemAudioTrack
+from core.webrtc.video_track import DesktopVideoTrack
+from core.audio.audio_track import SystemAudioTrack
 
 from aiortc import (
     RTCConfiguration,
@@ -24,7 +24,7 @@ from aiortc.rtcrtpsender import RTCRtpSender
 # LazyPC NVENC integration.
 # RTCRtpSender does not look up H264Encoder dynamically; it calls the
 # module-level get_encoder(codec). Patch that function instead.
-from webrtc.encoder_factory import get_encoder as lazy_get_encoder
+from core.webrtc.encoder_factory import get_encoder as lazy_get_encoder
 import aiortc.rtcrtpsender as _rtcrtpsender
 import aiortc.codecs as _codecs
 

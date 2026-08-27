@@ -9,7 +9,7 @@ import dxcam
 
 from aiortc import VideoStreamTrack
 
-from config.settings import ScreenConfig
+from core.config.settings import ScreenConfig
 
 
 # WebRTC video clock.

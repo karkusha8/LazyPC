@@ -1,5 +1,5 @@
 [project]
-name = "leksand-lazy-contol-server"
+name = "LazyPC-Agent"
 version = "0.1.0"
 description = ""
 authors = [
@@ -23,8 +23,12 @@ dependencies = [
     "sounddevice (>=0.5.6,<0.6.0)",
     "pyaudiowpatch (>=0.2.12.8,<0.3.0.0)",
     "cryptography (>=45.0.0,<47.0.0)",
-    "qrcode[pil] (>=8.2,<9.0)"
+    "qrcode[pil] (>=8.2,<9.0)",
+    "pywin32 (>=312,<313)"
 ]
+
+[tool.poetry]
+package-mode = false
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

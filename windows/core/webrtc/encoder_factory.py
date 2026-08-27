@@ -5,9 +5,9 @@ from typing import Any
 import av
 from aiortc.codecs import get_encoder as _original_get_encoder
 
-from webrtc.h264_cpu import H264CPUEncoder
-from webrtc.h264_nvenc import H264NVENCEncoder
-from webrtc.opus_audio import OpusAudioEncoder
+from core.webrtc.h264_cpu import H264CPUEncoder
+from core.webrtc.h264_nvenc import H264NVENCEncoder
+from core.webrtc.opus_audio import OpusAudioEncoder
 
 
 def _try_nvenc() -> bool:

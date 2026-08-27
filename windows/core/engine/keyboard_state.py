@@ -1,4 +1,4 @@
-from network.protocol import (
+from core.network.protocol import (
     LANG_EN,
     LANG_RU,
 )

@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import qrcode
 
-from security.trusted_pairing import TrustedPairingManager, PairingInvitation
+from core.security.trusted_pairing import TrustedPairingManager, PairingInvitation
 
 
 DEFAULT_QR_PATH = (

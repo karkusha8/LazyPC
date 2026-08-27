@@ -7,8 +7,8 @@ import time
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from security.pairing import TrustedDeviceStore
-from security.identity import WindowsIdentity
+from core.security.pairing import TrustedDeviceStore
+from core.security.identity import WindowsIdentity
 
 
 AUTH_VERSION = 3

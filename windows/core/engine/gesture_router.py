@@ -1,9 +1,9 @@
 import struct
 
-from engine.gesture_engine import GestureEngine
-from engine.keyboard_state import KeyboardState
+from core.engine.gesture_engine import GestureEngine
+from core.engine.keyboard_state import KeyboardState
 
-from network.protocol import (
+from core.network.protocol import (
 
     PACKET_TAP,
     PACKET_DOUBLE_TAP,

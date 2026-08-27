@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -14,15 +13,26 @@ class PeerRole(str, Enum):
 
 
 @dataclass
+class AgentEntry:
+    pc_id: str
+    ws: WebSocket
+
+
+@dataclass
+class ClientEntry:
+    ws: WebSocket
+    pc_id: Optional[str] = None
+    pairing_mode: bool = False
+    connection_mode: Optional[str] = None
+
+
+@dataclass
 class SessionState:
     """
-    Current signaling session.
+    Signaling-only routing state.
 
-    client_pairing is routing metadata only. It is NOT an authentication
-    decision and must never be treated as proof that a device is trusted.
+    pc_id is a public locator, not an authentication credential.
+    Cryptographic authentication remains inside ConnectionAuth.
     """
-    client_ws: Optional[WebSocket] = None
-    agent_ws: Optional[WebSocket] = None
-    client_pairing: bool = False
-    last_offer: Optional[str] = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    agents: dict[str, AgentEntry] = field(default_factory=dict)
+    clients: dict[WebSocket, ClientEntry] = field(default_factory=dict)

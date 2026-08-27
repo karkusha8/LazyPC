@@ -4,7 +4,7 @@ from fractions import Fraction
 import av
 from aiortc import MediaStreamTrack
 
-from audio.system_audio import SystemAudioCapture
+from core.audio.system_audio import SystemAudioCapture
 
 
 class SystemAudioTrack(MediaStreamTrack):
