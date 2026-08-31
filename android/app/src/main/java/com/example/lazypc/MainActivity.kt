@@ -133,6 +133,7 @@ class MainActivity : AppCompatActivity() {
     private var simpleConnectionConnecting by mutableStateOf(false)
     private var simpleConnectionConnected by mutableStateOf(false)
     private var simpleConnectionError by mutableStateOf<String?>(null)
+    private var simpleConnectionAwaitingSecret by mutableStateOf(false)
 
     private var connectionState by mutableStateOf<ConnectionState>(
         ConnectionState.Disconnected
@@ -504,26 +505,60 @@ class MainActivity : AppCompatActivity() {
                             webRtcService?.disconnectSession()
                         }
 
+                        // A finished remote session always returns to Home.
+                        // Do not pop the navigation stack: ConnectById is
+                        // represented by local UI state, so explicitly close
+                        // that flow as well.
+                        sessionConnecting = false
+                        sessionConnected = false
+                        simpleConnectionConnecting = false
+                        simpleConnectionConnected = false
+                        simpleConnectionAwaitingSecret = false
+                        simpleConnectionError = null
+                        showConnectById = false
                         connectionState = ConnectionState.Disconnected
                     })
             } else if (showConnectById) {
                 ConnectByIdScreen(
                     connecting = simpleConnectionConnecting,
                     connected = simpleConnectionConnected,
+                    awaitingSecret = simpleConnectionAwaitingSecret,
                     error = simpleConnectionError,
 
                     onConnect = { pcId ->
                         simpleConnectionError = null
+                        simpleConnectionAwaitingSecret = false
                         connectionState = ConnectionState.Connecting
                         webRtcService?.connectToPc(pcId)
                     },
 
-                    onBack = {
-                        if (!simpleConnectionConnecting) {
-                            showConnectById = false
+                    onSubmitSecret = { secret ->
+                        val accepted = webRtcService?.submitOrdinarySecret(secret) == true
+                        if (!accepted) {
+                            simpleConnectionError = "Не удалось отправить код"
+                        } else {
                             simpleConnectionError = null
-                            connectionState = ConnectionState.Disconnected
+                            simpleConnectionAwaitingSecret = true
+                            simpleConnectionConnecting = true
+                            connectionState = ConnectionState.VerifyingCode
                         }
+                    },
+
+                    onBack = {
+                        // Back from any stage of the direct ID flow is a real
+                        // cancellation, not just a UI navigation event.
+                        // The service sends SESSION_CLOSE to the PC and resets
+                        // the direct connection state.
+                        if (simpleConnectionConnecting || simpleConnectionAwaitingSecret) {
+                            webRtcService?.disconnectToPc()
+                        }
+
+                        showConnectById = false
+                        simpleConnectionConnecting = false
+                        simpleConnectionConnected = false
+                        simpleConnectionAwaitingSecret = false
+                        simpleConnectionError = null
+                        connectionState = ConnectionState.Disconnected
                     }
                 )
             } else {
@@ -542,7 +577,19 @@ class MainActivity : AppCompatActivity() {
 
                     onConnectById = {
                         simpleConnectionError = null
+                        simpleConnectionAwaitingSecret = false
                         showConnectById = true
+                    },
+                    onDeleteComputer = { pc ->
+                        trustedPcStore.remove(pc.pcCode)
+                        trustedPcs = trustedPcStore.list()
+
+                        pcOnline = pcOnline - pc.pcCode
+
+                        Log.d(
+                            TAG_APP,
+                            "🗑 Trusted PC removed locally: ${pc.pcCode}"
+                        )
                     },
 
                     onSettingsClick = {
@@ -604,8 +651,21 @@ class MainActivity : AppCompatActivity() {
             },
 
             onSessionState = { connecting, connected ->
+                val wasConnected = sessionConnected
+
                 sessionConnecting = connecting
                 sessionConnected = connected
+
+                // If an active Trusted Device session ends from the service
+                // side, return to Home instead of exposing the old
+                // Connect-by-ID screen.
+                if (wasConnected && !connected) {
+                    showConnectById = false
+                    simpleConnectionConnecting = false
+                    simpleConnectionConnected = false
+                    simpleConnectionAwaitingSecret = false
+                    simpleConnectionError = null
+                }
 
                 connectionState =
                     when {
@@ -616,10 +676,15 @@ class MainActivity : AppCompatActivity() {
             }
         )
 
-        service.registerTrustedPcPairedCallback { pcCode ->
+        service.registerTrustedPcPairedCallback { pcCode, pcIdentityPublic ->
             runOnUiThread {
-                trustedPcStore.addOrUpdate(pcCode)
+                trustedPcStore.addOrUpdate(
+                    pcCode = pcCode,
+                    pcIdentityPublic = pcIdentityPublic
+                )
+
                 trustedPcs = trustedPcStore.list()
+
                 Toast.makeText(
                     this,
                     "Компьютер добавлен в доверенные",
@@ -634,19 +699,51 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        service.registerOrdinaryAuthCallback {
+            runOnUiThread {
+                simpleConnectionAwaitingSecret = true
+                simpleConnectionError = null
+                simpleConnectionConnecting = true
+                connectionState = ConnectionState.Connecting
+            }
+        }
+
         service.registerDirectConnectionCallback {
                 connecting,
                 connected,
                 error ->
             runOnUiThread {
+                val wasConnected = simpleConnectionConnected
+
                 simpleConnectionConnecting = connecting
                 simpleConnectionConnected = connected
                 simpleConnectionError = error
 
+                // Do not leave the 9-digit-code screen on an authentication
+                // error. The code stage ends only after a successful connection.
+                if (connected) {
+                    simpleConnectionAwaitingSecret = false
+                }
+
+                // The direct session can also end without the user pressing
+                // the Disconnect button (remote close / service-side close).
+                // In that case the user should still land on Home.
+                if (wasConnected && !connected && error == null) {
+                    showConnectById = false
+                    simpleConnectionAwaitingSecret = false
+                    simpleConnectionError = null
+                }
+
                 connectionState =
                     when {
                         connected -> ConnectionState.Connected
-                        connecting -> ConnectionState.Connecting
+                        connecting -> {
+                            if (simpleConnectionAwaitingSecret) {
+                                ConnectionState.VerifyingCode
+                            } else {
+                                ConnectionState.Connecting
+                            }
+                        }
                         error != null -> ConnectionState.Error(error)
                         else -> ConnectionState.Disconnected
                     }

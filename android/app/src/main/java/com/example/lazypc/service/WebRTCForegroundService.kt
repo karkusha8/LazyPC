@@ -25,6 +25,7 @@ import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.VideoTrack
 
+
 class WebRTCForegroundService : Service() {
 
     companion object {
@@ -32,6 +33,7 @@ class WebRTCForegroundService : Service() {
         private const val CHANNEL_ID = "lazypc_webrtc"
         private const val NOTIFICATION_ID = 1001
         private const val SESSION_TIMEOUT_MS = 30_000L
+        private const val ORDINARY_AUTH_TIMEOUT_MS = 60_000L
 
         private const val SIGNALING_URL =
             "ws://192.168.0.148:8000/ws"
@@ -51,8 +53,9 @@ class WebRTCForegroundService : Service() {
     private var onCursorPosition: ((Float, Float) -> Unit)? = null
     private var onSignalingState: ((Boolean) -> Unit)? = null
     private var onSessionState: ((Boolean, Boolean) -> Unit)? = null
-    private var onTrustedPcPaired: ((String) -> Unit)? = null
+    private var onTrustedPcPaired: ((String, String?) -> Unit)? = null
     private var onDirectSessionState: ((Boolean, Boolean, String?) -> Unit)? = null
+    private var onOrdinaryAuthRequired: (() -> Unit)? = null
     private var onPcStatus: ((String, Boolean) -> Unit)? = null
 
     private var sessionConnecting = false
@@ -67,6 +70,7 @@ class WebRTCForegroundService : Service() {
      * Completely separate from direct PC selection.
      */
     private var pendingPairingPayload: String? = null
+    private var pendingPairingPcIdentityPublic: String? = null
 
     /*
      * ---------------------------------------------------------------------
@@ -344,7 +348,7 @@ class WebRTCForegroundService : Service() {
     }
 
     fun registerTrustedPcPairedCallback(
-        callback: (String) -> Unit
+        callback: (String, String?) -> Unit
     ) {
         onTrustedPcPaired = callback
     }
@@ -365,6 +369,16 @@ class WebRTCForegroundService : Service() {
         return ws.requestPcStatus(pcCode)
     }
 
+    fun registerOrdinaryAuthCallback(
+        callback: () -> Unit
+    ) {
+        onOrdinaryAuthRequired = callback
+    }
+
+    fun submitOrdinarySecret(secret: String): Boolean {
+        return ws.submitOrdinarySecret(secret)
+    }
+
     fun registerDirectConnectionCallback(
         callback: (Boolean, Boolean, String?) -> Unit
     ) {
@@ -383,6 +397,7 @@ class WebRTCForegroundService : Service() {
         onSessionState = null
         onTrustedPcPaired = null
         onDirectSessionState = null
+        onOrdinaryAuthRequired = null
     }
 
     // =====================================================================
@@ -626,7 +641,7 @@ class WebRTCForegroundService : Service() {
 
         directSessionTimeoutJob?.cancel()
         directSessionTimeoutJob = serviceScope.launch {
-            delay(SESSION_TIMEOUT_MS)
+            delay(ORDINARY_AUTH_TIMEOUT_MS)
             if (directAttemptActive && !directConnected) {
                 failDirectConnection("Connection timeout")
             }
@@ -805,6 +820,11 @@ class WebRTCForegroundService : Service() {
         pendingPairingPayload =
             qrPayload
 
+        pendingPairingPcIdentityPublic =
+            qrPayload.split('|')
+                .getOrNull(4)
+                ?.takeIf { it.isNotBlank() }
+
         Log.d(
             TAG,
             "🔐 Starting Trusted Device pairing session"
@@ -920,6 +940,7 @@ class WebRTCForegroundService : Service() {
          * They are mutually exclusive.
          */
         pendingPairingPayload = null
+        pendingPairingPcIdentityPublic = null
         pendingPcId = null
 
         sessionGeneration++
@@ -973,6 +994,7 @@ class WebRTCForegroundService : Service() {
         )
 
         pendingPairingPayload = null
+        pendingPairingPcIdentityPublic = null
         pendingPcId = null
 
         val generationAtDisconnect =
@@ -1151,8 +1173,12 @@ class WebRTCForegroundService : Service() {
                     val pcCode = json.optString("pc_code")
                     val normalized = pcCode.filter { it.isDigit() }
                     if (normalized.length == 9) {
+                        val pcIdentityPublic = pendingPairingPcIdentityPublic
+
                         Log.d(TAG, "✅ Trusted PC pairing completed: $normalized")
-                        onTrustedPcPaired?.invoke(normalized)
+                        onTrustedPcPaired?.invoke(normalized, pcIdentityPublic)
+
+                        pendingPairingPcIdentityPublic = null
                     }
                 }
 
@@ -1226,6 +1252,30 @@ class WebRTCForegroundService : Service() {
                  * EXISTING WEBRTC SIGNALING
                  * ---------------------------------------------------------
                  */
+
+                "ordinary_auth_challenge" -> {
+                    if (directAttemptActive) {
+                        Log.i(
+                            TAG,
+                            "🔐 Ordinary V2 authentication requires one-time secret"
+                        )
+                        onOrdinaryAuthRequired?.invoke()
+                    }
+                }
+
+                "ordinary_auth_rejected" -> {
+                    val reason = json.optString("reason", "unknown")
+                    Log.e(TAG, "❌ Ordinary V2 authentication rejected: $reason")
+                    failDirectConnection(
+                        when (reason) {
+                            "user_declined" -> "Подключение отклонено на компьютере"
+                            "invalid_secret", "authentication_failed" -> "Неверный код компьютера"
+                            "expired" -> "Код компьютера истёк"
+                            "rate_limited" -> "Слишком много попыток"
+                            else -> "Ошибка авторизации"
+                        }
+                    )
+                }
 
                 "connection_auth_rejected" -> {
                     val reason = json.optString(
@@ -1398,6 +1448,7 @@ class WebRTCForegroundService : Service() {
         onDirectSessionState = null
 
         pendingPairingPayload = null
+        pendingPairingPcIdentityPublic = null
         pendingPcId = null
         pendingTrustedPcCode = null
         trustedAttemptActive = false

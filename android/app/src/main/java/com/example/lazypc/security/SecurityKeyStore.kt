@@ -137,6 +137,29 @@ class SecurityKeyStore {
                 null
             )
 
+    /**
+     * Completely forgets the Android-side credentials belonging to one PC.
+     *
+     * Deletes only the per-PC Device Key and its Identity -> Device binding.
+     * The global Identity Key and the global StrongBox hardware key remain intact.
+     */
+    fun deleteCredentialsForPc(
+        context: Context,
+        pcIdentityPublic: String
+    ) {
+        require(pcIdentityPublic.isNotBlank()) { "PC identity is empty" }
+
+        val keyAlias = deviceAlias(pcIdentityPublic)
+        if (keyStore.containsAlias(keyAlias)) {
+            keyStore.deleteEntry(keyAlias)
+        }
+
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .remove(PREF_IDENTITY_BINDING_PREFIX + pcKeyId(pcIdentityPublic))
+            .apply()
+    }
+
     fun identityPublicKeyBase64(): String =
         Base64.encodeToString(
             publicKey(IDENTITY_ALIAS).encoded,

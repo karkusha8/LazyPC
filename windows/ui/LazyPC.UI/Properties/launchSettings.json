@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "LazyPC.UI (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "LazyPC.UI (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

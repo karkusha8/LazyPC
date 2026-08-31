@@ -1,14 +1,13 @@
 package com.example.lazypc.network
 
 import android.content.Context
-import android.util.Base64
+import android.os.Build
 import android.util.Log
 import com.example.lazypc.security.SecurityKeyStore
+import com.example.lazypc.security.ordinary.OrdinaryAuthenticator
 import okhttp3.*
 import okio.ByteString
 import org.json.JSONObject
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 class WsClient(
@@ -30,6 +29,25 @@ class WsClient(
     private var onPcStatus: ((String, Boolean) -> Unit)? = null
 
     private val securityKeyStore = SecurityKeyStore()
+
+    private val ordinaryAuthenticator = OrdinaryAuthenticator(
+        keyStore = securityKeyStore,
+        send = { json -> sendText(json.toString()) }
+    )
+
+    /**
+     * Submit the 9-digit Ordinary V2 secret entered by the user.
+     * The secret is consumed locally and is never serialized into signaling.
+     */
+    fun submitOrdinarySecret(secret: String): Boolean =
+        ordinaryAuthenticator.submitSecret(secret)
+
+    fun hasPendingOrdinaryChallenge(): Boolean =
+        ordinaryAuthenticator.hasPendingChallenge()
+
+    fun clearOrdinaryAuth() {
+        ordinaryAuthenticator.clear()
+    }
 
     fun setOnTextMessage(callback: (String) -> Unit) {
         onText = callback
@@ -161,11 +179,25 @@ class WsClient(
         val json = JSONObject().apply {
             put("type", "find_pc")
             put("pc_id", formatted)
+
+            // Device metadata is sent alongside the ordinary PC lookup.
+            // This is informational data for the Windows UI and is
+            // intentionally separate from the cryptographic identity.
+            put(
+                "device",
+                JSONObject().apply {
+                    put("platform", "Android")
+                    put("manufacturer", Build.MANUFACTURER)
+                    put("model", Build.MODEL)
+                    put("android_version", Build.VERSION.RELEASE)
+                }
+            )
         }
 
         Log.i(
             "LazyPC-Security",
-            "📤 find_pc sent: $formatted"
+            "📤 find_pc sent: $formatted " +
+                    "[${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}]"
         )
 
         return sendText(json.toString())
@@ -402,197 +434,6 @@ class WsClient(
         }
     }
 
-    /**
-     * Ordinary/direct PC-code authentication.
-     *
-     * Windows sends:
-     *
-     * {
-     *   "type": "connection_auth_challenge",
-     *   "version": 1,
-     *   "algorithm": "ECDSA-P256-IDENTITY-V1",
-     *   "connection_id": "...",
-     *   "pc_identity_public": "...",
-     *   "challenge": "..."
-     * }
-     *
-     * Android signs exactly:
-     *
-     * LAZYPC_CONNECTION_AUTH_V1|
-     * <connection_id>|
-     * <pc_identity_public>|
-     * <identity_public>|
-     * <challenge>
-     *
-     * The challenge is Base64 text exactly as received from Windows.
-     */
-    private fun handleConnectionAuthChallenge(
-        json: JSONObject
-    ) {
-        try {
-            val version = json.optInt("version", -1)
-            val algorithm = json.optString("algorithm")
-            val connectionId = json.optString("connection_id")
-            val challenge = json.optString("challenge")
-            val pcIdentityPublic = json.optString("pc_identity_public")
-
-            if (version != 1) {
-                Log.e(
-                    "LazyPC-Security",
-                    "Unsupported connection AUTH version: $version"
-                )
-                return
-            }
-
-            if (algorithm != "ECDSA-P256-IDENTITY-V1") {
-                Log.e(
-                    "LazyPC-Security",
-                    "Unsupported connection AUTH algorithm: $algorithm"
-                )
-                return
-            }
-
-            if (connectionId.isBlank()) {
-                Log.e(
-                    "LazyPC-Security",
-                    "Connection AUTH challenge has no connection_id"
-                )
-                return
-            }
-
-            if (challenge.isBlank()) {
-                Log.e(
-                    "LazyPC-Security",
-                    "Connection AUTH challenge is empty"
-                )
-                return
-            }
-
-            if (pcIdentityPublic.isBlank()) {
-                Log.e(
-                    "LazyPC-Security",
-                    "Connection AUTH challenge has no PC identity"
-                )
-                return
-            }
-
-            securityKeyStore.ensureKeys()
-
-            val identityPublic =
-                securityKeyStore.identityPublicKeyBase64()
-
-            val deviceId =
-                deriveAndroidDeviceId(identityPublic)
-
-            val transcript = (
-                    "LAZYPC_CONNECTION_AUTH_V1|" +
-                            "$connectionId|" +
-                            "$pcIdentityPublic|" +
-                            "$identityPublic|" +
-                            challenge
-                    ).toByteArray(StandardCharsets.UTF_8)
-
-            /*
-             * SecurityKeyStore already returns the signature
-             * as a Base64 String.
-             *
-             * Do NOT Base64-encode it again here.
-             */
-            val identitySignature: String =
-                securityKeyStore.signIdentity(
-                    data = transcript
-                )
-
-            val response = JSONObject().apply {
-                put(
-                    "type",
-                    "connection_auth_response"
-                )
-
-                put(
-                    "version",
-                    1
-                )
-
-                put(
-                    "algorithm",
-                    "ECDSA-P256-IDENTITY-V1"
-                )
-
-                put(
-                    "connection_id",
-                    connectionId
-                )
-
-                put(
-                    "identity_public",
-                    identityPublic
-                )
-
-                put(
-                    "identity_signature",
-                    identitySignature
-                )
-
-                put(
-                    "device_id",
-                    deviceId
-                )
-            }
-
-            if (sendText(response.toString())) {
-                Log.i(
-                    "LazyPC-Security",
-                    "🟢 CONNECTION_AUTH_RESPONSE sent"
-                )
-            } else {
-                Log.e(
-                    "LazyPC-Security",
-                    "❌ CONNECTION_AUTH_RESPONSE send failed"
-                )
-            }
-
-        } catch (error: Throwable) {
-            Log.e(
-                "LazyPC-Security",
-                "❌ Connection AUTH challenge handling failed",
-                error
-            )
-        }
-    }
-
-    /**
-     * Same stable device-id derivation used by the Windows ConnectionAuth.
-     *
-     * SHA-256(identity_public DER)
-     * -> URL-safe Base64 without '='
-     * -> first 22 chars
-     * -> "android-" prefix
-     */
-    private fun deriveAndroidDeviceId(
-        identityPublicBase64: String
-    ): String {
-        val identityDer =
-            Base64.decode(
-                identityPublicBase64,
-                Base64.DEFAULT
-            )
-
-        val digest =
-            MessageDigest.getInstance("SHA-256")
-                .digest(identityDer)
-
-        val encoded =
-            Base64.encodeToString(
-                digest,
-                Base64.URL_SAFE or
-                        Base64.NO_WRAP or
-                        Base64.NO_PADDING
-            )
-
-        return "android-" + encoded.take(22)
-    }
-
     @Synchronized
     private fun handleSocketEnded(
         endedSocket: WebSocket,
@@ -610,6 +451,7 @@ class WsClient(
     @Synchronized
     fun close() {
         manuallyClosed = true
+        ordinaryAuthenticator.clear()
 
         val current = socket
 
@@ -696,15 +538,80 @@ class WsClient(
                         }
 
                         /*
-                         * New ordinary/direct PC-code model.
+                         * Ordinary V2 authentication.
+                         *
+                         * The challenge is cached locally. The 9-digit
+                         * secret is entered by the user and supplied through
+                         * submitOrdinarySecret(). It never crosses signaling.
                          */
-                        "connection_auth_challenge" -> {
+                        "ordinary_auth_challenge" -> {
                             Log.i(
                                 "LazyPC-Security",
-                                "📥 CONNECTION_AUTH_CHALLENGE received"
+                                "📥 ORDINARY_AUTH_CHALLENGE received"
                             )
 
-                            handleConnectionAuthChallenge(json)
+                            if (!ordinaryAuthenticator.acceptChallenge(json)) {
+                                Log.e(
+                                    "LazyPC-Security",
+                                    "❌ Invalid Ordinary V2 challenge"
+                                )
+                                return
+                            }
+
+                            onText?.invoke(text)
+                            return
+                        }
+
+                        "ordinary_auth_server_proof" -> {
+                            if (!ordinaryAuthenticator.handleServerProof(json)) {
+                                Log.e(
+                                    "LazyPC-Security",
+                                    "❌ Ordinary server identity proof rejected"
+                                )
+                                return
+                            }
+
+                            onText?.invoke(text)
+                            return
+                        }
+
+                        "ordinary_key_confirmation" -> {
+                            if (!ordinaryAuthenticator.handleServerKeyConfirmation(json)) {
+                                Log.e(
+                                    "LazyPC-Security",
+                                    "❌ Ordinary server key confirmation rejected"
+                                )
+                                return
+                            }
+
+                            onText?.invoke(text)
+                            return
+                        }
+
+                        "ordinary_auth_complete" -> {
+                            if (ordinaryAuthenticator.handleComplete(json)) {
+                                Log.i(
+                                    "LazyPC-Security",
+                                    "🟢 ORDINARY V2 AUTHENTICATED"
+                                )
+                            } else {
+                                Log.e(
+                                    "LazyPC-Security",
+                                    "❌ Invalid Ordinary V2 completion"
+                                )
+                            }
+
+                            onText?.invoke(text)
+                            return
+                        }
+
+                        "ordinary_auth_rejected" -> {
+                            Log.e(
+                                "LazyPC-Security",
+                                "❌ Ordinary V2 rejected: ${json.optString("reason")}"
+                            )
+                            ordinaryAuthenticator.clear()
+                            onText?.invoke(text)
                             return
                         }
                     }

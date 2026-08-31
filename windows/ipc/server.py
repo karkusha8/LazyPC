@@ -11,6 +11,11 @@ MessageHandler = Callable[
     Optional[dict] | Awaitable[Optional[dict]],
 ]
 
+ConnectHandler = Callable[
+    [],
+    None | Awaitable[None],
+]
+
 
 class WebSocketServer:
     HOST = "127.0.0.1"
@@ -20,8 +25,10 @@ class WebSocketServer:
     def __init__(
         self,
         on_message: Optional[MessageHandler] = None,
+        on_connect: Optional[ConnectHandler] = None,
     ):
         self.on_message = on_message
+        self.on_connect = on_connect
 
         self._server = None
         self._client: ServerConnection | None = None
@@ -79,7 +86,6 @@ class WebSocketServer:
             )
 
             async with self._client_lock:
-                # UI could disconnect while waiting for the lock.
                 if self._client is not client:
                     return False
 
@@ -133,6 +139,22 @@ class WebSocketServer:
                     separators=(",", ":"),
                 )
             )
+
+            # UI подключился.
+            # Agent сразу отправляет актуальное состояние,
+            # включая Trusted Devices из SQLite.
+            if self.on_connect is not None:
+                try:
+                    result = self.on_connect()
+
+                    if asyncio.iscoroutine(result):
+                        await result
+
+                except Exception as error:
+                    print(
+                        "[IPC] UI connect handler failed:",
+                        error,
+                    )
 
             async for raw_message in websocket:
                 await self._handle_message(

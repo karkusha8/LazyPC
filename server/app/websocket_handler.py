@@ -228,9 +228,15 @@ async def _handle_find_pc(
         )
         return
 
+    device = message.get("device")
+
+    if not isinstance(device, dict):
+        device = None
+
     if not await registry.set_client_pc(
         ws,
         resolved_pc_id,
+        device=device,
     ):
         await safe_send_text(
             ws,
@@ -254,7 +260,11 @@ async def _handle_find_pc(
     )
 
     # Normal mode starts only after a concrete PC was selected.
-    create_sent = await registry.send_create_session(resolved_pc_id)
+    # Forward the Android device metadata to the Windows Agent.
+    create_sent = await registry.send_create_session(
+        resolved_pc_id,
+        device=device,
+    )
 
     if not create_sent:
         print(

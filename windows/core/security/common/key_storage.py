@@ -1,4 +1,4 @@
-from __future__ import annotations
+
 
 import base64
 import ctypes
@@ -18,26 +18,14 @@ class DATA_BLOB(ctypes.Structure):
 crypt32 = ctypes.windll.crypt32
 kernel32 = ctypes.windll.kernel32
 
-crypt32.CryptProtectData.argtypes = [
-    ctypes.POINTER(DATA_BLOB),
-    wintypes.LPCWSTR,
-    ctypes.POINTER(DATA_BLOB),
-    wintypes.LPVOID,
-    ctypes.POINTER(DATA_BLOB),
-    wintypes.DWORD,
-    ctypes.POINTER(DATA_BLOB),
-]
-crypt32.CryptProtectData.restype = wintypes.BOOL
+# Do not set argtypes for the DPAPI functions.
+#
+# Python ctypes can produce an LP_DATA_BLOB conversion mismatch here when
+# the DATA_BLOB structure is defined in a project module that is reloaded.
+# The calls below use ctypes.byref(DATA_BLOB) and therefore pass the native
+# pointer directly to Win32.
 
-crypt32.CryptUnprotectData.argtypes = [
-    ctypes.POINTER(DATA_BLOB),
-    ctypes.POINTER(wintypes.LPWSTR),
-    ctypes.POINTER(DATA_BLOB),
-    wintypes.LPVOID,
-    ctypes.POINTER(DATA_BLOB),
-    wintypes.DWORD,
-    ctypes.POINTER(DATA_BLOB),
-]
+crypt32.CryptProtectData.restype = wintypes.BOOL
 crypt32.CryptUnprotectData.restype = wintypes.BOOL
 
 kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
@@ -47,15 +35,27 @@ CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
 def _blob(data: bytes) -> DATA_BLOB:
-    if not data:
-        buffer = ctypes.create_string_buffer(b"\x00")
-        return DATA_BLOB(0, ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    """Create a DATA_BLOB and keep its backing buffer alive."""
+    if not isinstance(data, bytes):
+        raise TypeError("DPAPI input must be bytes.")
 
-    buffer = ctypes.create_string_buffer(data)
-    return DATA_BLOB(
-        len(data),
-        ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)),
+    if data:
+        buffer = ctypes.create_string_buffer(data)
+        size = len(data)
+    else:
+        buffer = ctypes.create_string_buffer(1)
+        size = 0
+
+    blob = DATA_BLOB()
+    blob.cbData = size
+    blob.pbData = ctypes.cast(
+        buffer,
+        ctypes.POINTER(ctypes.c_byte),
     )
+
+    # Keep the source buffer alive until the DATA_BLOB itself is released.
+    blob._buffer = buffer
+    return blob
 
 
 def dpapi_protect(data: bytes) -> bytes:
@@ -74,9 +74,13 @@ def dpapi_protect(data: bytes) -> bytes:
         raise ctypes.WinError()
 
     try:
-        return ctypes.string_at(result.pbData, result.cbData)
+        return ctypes.string_at(
+            result.pbData,
+            result.cbData,
+        )
     finally:
-        kernel32.LocalFree(result.pbData)
+        if result.pbData:
+            kernel32.LocalFree(result.pbData)
 
 
 def dpapi_unprotect(data: bytes) -> bytes:
@@ -96,9 +100,14 @@ def dpapi_unprotect(data: bytes) -> bytes:
         raise ctypes.WinError()
 
     try:
-        return ctypes.string_at(result.pbData, result.cbData)
+        return ctypes.string_at(
+            result.pbData,
+            result.cbData,
+        )
     finally:
-        kernel32.LocalFree(result.pbData)
+        if result.pbData:
+            kernel32.LocalFree(result.pbData)
+
         if description:
             kernel32.LocalFree(description)
 

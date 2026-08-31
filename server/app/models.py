@@ -24,6 +24,8 @@ class ClientEntry:
     pc_id: Optional[str] = None
     pairing_mode: bool = False
     connection_mode: Optional[str] = None
+    # Non-sensitive Android device metadata for UI/display purposes.
+    device: Optional[dict[str, str]] = None
 
 
 @dataclass

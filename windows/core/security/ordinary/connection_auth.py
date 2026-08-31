@@ -9,7 +9,7 @@ import uuid
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from core.security.identity import WindowsIdentity
+from security.common.identity import WindowsIdentity
 
 
 AUTH_VERSION = 1

@@ -1,6 +1,7 @@
 package com.example.lazypc.security
 
 import android.content.Context
+import android.os.Build
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
@@ -128,6 +129,10 @@ class TrustedPairing(
             put("hardware_signature", hardwareSignature)
             put("attestation_challenge", hardware.attestationChallengeBase64)
             put("attestation_chain", JSONArray(hardware.attestationChainBase64))
+            put("platform", "Android")
+            put("manufacturer", Build.MANUFACTURER)
+            put("model", Build.MODEL)
+            put("android_version", Build.VERSION.RELEASE ?: "")
         }
     }
 }

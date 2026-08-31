@@ -227,6 +227,12 @@ __marimo__/
 **/build/
 local.properties
 
+# Visual Studio
+.vs/
+**/.vs/
+**/bin/
+**/obj/
+
 # OS
 .DS_Store
 Thumbs.db

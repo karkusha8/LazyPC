@@ -95,6 +95,7 @@ class ConnectionRegistry:
             pc_id: str,
             *,
             connection_mode: Optional[str] = None,
+            device: Optional[dict[str, str]] = None,
     ) -> bool:
         async with self._lock:
             client = self._state.clients.get(ws)
@@ -113,7 +114,20 @@ class ConnectionRegistry:
 
             client.pc_id = pc_id
             client.connection_mode = connection_mode
+            client.device = device
             return True
+
+    async def get_client_device(
+            self,
+            ws: WebSocket,
+    ) -> Optional[dict[str, str]]:
+        async with self._lock:
+            client = self._state.clients.get(ws)
+
+            if client is None or client.device is None:
+                return None
+
+            return dict(client.device)
 
     async def get_agent(
             self,
@@ -254,6 +268,7 @@ class ConnectionRegistry:
             if client is not None:
                 client.pc_id = None
                 client.connection_mode = None
+                client.device = None
 
     async def forward_client_to_agent(
         self,
@@ -300,6 +315,7 @@ class ConnectionRegistry:
             pc_id: str,
             *,
             connection_mode: Optional[str] = None,
+            device: Optional[dict[str, str]] = None,
     ) -> bool:
         print(
             f"[REGISTRY] send_create_session START: "
@@ -330,6 +346,9 @@ class ConnectionRegistry:
         }
         if connection_mode is not None:
             payload["connection_mode"] = connection_mode
+
+        if device is not None:
+            payload["device"] = dict(device)
 
         result = await safe_send_text(
             agent,

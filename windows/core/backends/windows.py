@@ -12,6 +12,8 @@ WM_INPUTLANGCHANGEREQUEST = 0x0050
 HWND_BROADCAST = 0xFFFF
 
 INPUT_KEYBOARD = 1
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
 
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -539,50 +541,38 @@ class WindowsBackend:
     # MOUSE MOVE
     # ============================================================
 
-
-    def move(
-
-        self,
-
-        dx: float,
-
-        dy: float
-    ):
-
-
-        pyautogui.moveRel(
-
-            int(dx),
-
-            int(dy),
-
-            duration=0
+    def move(self, dx: float, dy: float):
+        inp = INPUT()
+        inp.type = INPUT_MOUSE
+        inp.mi = MOUSEINPUT(
+            dx=int(dx),
+            dy=int(dy),
+            mouseData=0,
+            dwFlags=MOUSEEVENTF_MOVE,
+            time=0,
+            dwExtraInfo=0,
         )
+
+        self._send_input(inp)
 
 
     # ============================================================
     # DRAG
     # ============================================================
 
-
-    def drag(
-
-        self,
-
-        dx: float,
-
-        dy: float
-    ):
-
-
-        pyautogui.moveRel(
-
-            int(dx),
-
-            int(dy),
-
-            duration=0
+    def drag(self, dx: float, dy: float):
+        inp = INPUT()
+        inp.type = INPUT_MOUSE
+        inp.mi = MOUSEINPUT(
+            dx=int(dx),
+            dy=int(dy),
+            mouseData=0,
+            dwFlags=MOUSEEVENTF_MOVE,
+            time=0,
+            dwExtraInfo=0,
         )
+
+        self._send_input(inp)
 
 
     # ============================================================

@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from .attestation_verifier import AttestationError, verify_hardware_attestation
-from .identity import WindowsIdentity
+from security.common.identity import WindowsIdentity
 from .pairing import TrustedDeviceStore
 
 
@@ -135,6 +135,11 @@ class TrustedPairingManager:
         attestation_chain = response.get("attestation_chain")
         attestation_challenge = response.get("attestation_challenge")
 
+        platform = response.get("platform")
+        manufacturer = response.get("manufacturer")
+        model = response.get("model")
+        android_version = response.get("android_version")
+
         if not all((
             identity_public,
             device_public,
@@ -219,6 +224,10 @@ class TrustedPairingManager:
             hardware_algorithm="ECDSA-P256",
             hardware_security="StrongBox",
             attestation_challenge=attestation_challenge,
+            platform=platform,
+            manufacturer=manufacturer,
+            model=model,
+            android_version=android_version,
         )
 
         self._pending = None

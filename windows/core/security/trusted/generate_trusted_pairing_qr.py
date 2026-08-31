@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 
 from pairing_qr import create_pairing_qr, delete_pairing_qr
-from core.security.trusted_pairing import TrustedPairingManager
+from security.trusted.trusted_pairing import TrustedPairingManager
 
 
 OUTPUT = (

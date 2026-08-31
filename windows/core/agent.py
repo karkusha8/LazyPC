@@ -10,16 +10,17 @@ from engine.gesture_router import GestureRouter
 from engine.keyboard_state import KeyboardState
 
 from network.signaling import SignalingClient
-from core.security.identity import WindowsIdentity
+from security.common.identity import WindowsIdentity
 
-from core.security.auth import AndroidAuthenticator
-from core.security.connection_auth import ConnectionAuth
-from core.security.trusted_pairing import TrustedPairingManager
-from core.security.pairing_qr import create_pairing_qr
+from security.ordinary.auth import OrdinaryAuthenticator
+from security.trusted.auth import AndroidAuthenticator
+from security.trusted.trusted_pairing import TrustedPairingManager
+from security.trusted.pairing_qr import create_pairing_qr
 
 from webrtc.peer import PeerConnection
 
 from ipc.server import WebSocketServer
+from security.trusted.pairing import TrustedDeviceStore
 
 
 class Agent:
@@ -35,6 +36,7 @@ class Agent:
 
         self.windows_identity = WindowsIdentity()
         self.windows_identity.ensure_created()
+        self.trusted_devices = TrustedDeviceStore()
 
         self.pc_id = self.windows_identity.device_id()
 
@@ -51,12 +53,14 @@ class Agent:
 
         # Two authentication paths are intentionally kept separate:
         #
-        #   AndroidAuthenticator -> existing Trusted Device V3 auth
-        #   ConnectionAuth       -> manual/direct connection auth
+        #   AndroidAuthenticator  -> existing Trusted Device V3 auth
+        #   OrdinaryAuthenticator -> Ordinary V2 manual/direct auth
         #
         # Trusted devices must NOT be forced through the manual UI path.
         self.trusted_authenticator = AndroidAuthenticator()
-        self.connection_auth = ConnectionAuth()
+        self.ordinary_authenticator = OrdinaryAuthenticator(
+            identity=self.windows_identity
+        )
 
         self.authenticated = False
         self.pairing_mode = False
@@ -73,6 +77,7 @@ class Agent:
         self._pending_auth_challenge: dict | None = None
         self._pending_manual_connection_id: str | None = None
         self._pending_manual_device_id: str | None = None
+        self._pending_manual_device: dict[str, str] | None = None
 
         # ============================================================
         # WEBRTC
@@ -197,8 +202,8 @@ class Agent:
 
     async def _auth_timeout_watch(self):
         try:
-            # ConnectionAuth challenges expire after 15 seconds.
-            await asyncio.sleep(15.5)
+            # Authentication sessions use a 60 second lifetime.
+            await asyncio.sleep(60.5 if self.connection_mode == "ordinary" else 15.5)
 
             if self.authenticated or self._stopping:
                 return
@@ -255,6 +260,7 @@ class Agent:
             self,
             connection_id: str,
             device_id: str,
+            device: dict[str, str] | None = None,
     ) -> bool:
 
         if self._event_loop is None:
@@ -274,6 +280,9 @@ class Agent:
             "connection_id": connection_id,
             "device_id": device_id,
         }
+
+        if device is not None:
+            request["device"] = dict(device)
 
         if not await self.ipc.send(request):
             print("[SECURITY] UI is not connected")
@@ -312,13 +321,14 @@ class Agent:
         self.pairing_mode = False
         self.connection_mode = "ordinary"
         self._cancel_auth_timeout()
-        self.connection_auth.clear()
+        self.ordinary_authenticator.clear()
 
         # AndroidAuthenticator is stateless between sessions and does not
         # expose a clear() method. Do not call a non-existent API here.
         self._pending_auth_challenge = None
         self._pending_manual_connection_id = None
         self._pending_manual_device_id = None
+        self._pending_manual_device = None
 
     # ================================================================
     # SIGNALING / SECURITY
@@ -392,16 +402,37 @@ class Agent:
             # Explicitly ordinary means:
             #   1. DO NOT send Trusted AUTH V3.
             #   2. Ask the Windows user for Accept / Decline.
-            #   3. Only after approval start ConnectionAuth V1.
+            #   3. Only after approval start Ordinary V2.
             if self.connection_mode == "ordinary":
                 device_id = message.get("device_id")
                 if not isinstance(device_id, str) or not device_id.strip():
                     device_id = "Android"
 
+                raw_device = message.get("device")
+                device: dict[str, str] | None = None
+
+                if isinstance(raw_device, dict):
+                    cleaned_device: dict[str, str] = {}
+
+                    for key in (
+                        "platform",
+                        "manufacturer",
+                        "model",
+                        "android_version",
+                    ):
+                        value = raw_device.get(key)
+
+                        if isinstance(value, str) and value.strip():
+                            cleaned_device[key] = value.strip()[:128]
+
+                    if cleaned_device:
+                        device = cleaned_device
+
                 connection_id = str(uuid.uuid4())
 
                 self._pending_manual_device_id = device_id
                 self._pending_manual_connection_id = connection_id
+                self._pending_manual_device = device
 
                 print(
                     "[SECURITY] Ordinary connection requested"
@@ -414,6 +445,7 @@ class Agent:
                 accepted = await self._request_ui_approval(
                     connection_id,
                     device_id,
+                    device,
                 )
 
                 if not accepted:
@@ -424,9 +456,9 @@ class Agent:
                     try:
                         await self.signaling.send(
                             {
-                                "type": "connection_auth_rejected",
-                                "version": 1,
-                                "connection_id": connection_id,
+                                "type": "ordinary_auth_rejected",
+                                "version": 2,
+                                "session_id": None,
                                 "reason": "user_declined",
                             }
                         )
@@ -449,19 +481,36 @@ class Agent:
                     "[SECURITY] Manual connection accepted by user"
                 )
 
-                challenge = self.connection_auth.create_session()
+                challenge = self.ordinary_authenticator.create_session()
+
+                # The one-time 9-digit secret is deliberately delivered only
+                # to the local Windows UI. It is never sent through signaling.
+                auth_secret = self.ordinary_authenticator.get_display_secret()
 
                 await self.signaling.send(
                     challenge
                 )
 
+                await self.ipc.send(
+                    {
+                        "type": "ordinary_auth_secret",
+                        "session_id": challenge["session_id"],
+                        "secret": auth_secret,
+                    }
+                )
+
                 print(
-                    "[SECURITY] Connection AUTH_CHALLENGE sent "
+                    "[SECURITY] Ordinary V2 AUTH_CHALLENGE sent "
                     "after manual approval"
+                )
+                print(
+                    "[SECURITY] One-time authentication secret delivered "
+                    "to local UI"
                 )
 
                 self._pending_manual_connection_id = None
                 self._pending_manual_device_id = None
+                self._pending_manual_device = None
 
                 self._start_auth_timeout()
 
@@ -590,43 +639,122 @@ class Agent:
             return
 
         # ============================================================
-        # ORDINARY / MANUAL AUTH RESPONSE (V1)
+        # ORDINARY AUTH RESPONSE (V2)
         # ============================================================
 
-        if message_type == "connection_auth_response":
+        if message_type == "ordinary_auth_response":
 
-            self._cancel_auth_timeout()
+            if self.connection_mode != "ordinary":
+                return
+
+            session_id = message.get("session_id")
 
             try:
                 auth_result = (
-                    self.connection_auth.verify_response(
+                    self.ordinary_authenticator.verify_client_response(
                         message
                     )
                 )
 
                 print(
-                    "[SECURITY] Android identity authenticated"
+                    "[SECURITY] Ordinary V2 client authentication PASS"
                 )
                 print(
-                    "[SECURITY] Manual approval already passed"
+                    "[SECURITY] Android identity + one-time secret verified"
                 )
 
-                # Mutual authentication for the ordinary/direct path.
-                server_auth = (
-                    self.connection_auth
-                    .server_authentication_message()
+                server_proof = (
+                    self.ordinary_authenticator.build_server_proof()
                 )
 
                 await self.signaling.send(
-                    server_auth
+                    server_proof
                 )
 
                 print(
-                    "[SECURITY] Windows identity proof sent"
+                    "[SECURITY] Ordinary V2 Windows identity proof sent"
                 )
 
+                server_confirmation = (
+                    self.ordinary_authenticator
+                    .build_server_key_confirmation()
+                )
+
+                await self.signaling.send(
+                    server_confirmation
+                )
+
+                print(
+                    "[SECURITY] Ordinary V2 server key confirmation sent"
+                )
+
+                return
+
+            except Exception as error:
+
+                self.authenticated = False
+
+                print(
+                    "[SECURITY] Ordinary V2 AUTH FAILED:",
+                    error
+                )
+
+                try:
+                    await self.signaling.send(
+                        {
+                            "type": "ordinary_auth_rejected",
+                            "version": 2,
+                            "session_id": session_id,
+                            "reason": "authentication_failed",
+                        }
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    await self.peer.stop_session()
+                except Exception as cleanup_error:
+                    print(
+                        "[SECURITY] AUTH failure cleanup failed:",
+                        cleanup_error
+                    )
+
+                self._clear_connection_state()
+
+                print(
+                    "[AGENT] Waiting for next client..."
+                )
+
+            return
+
+        # ============================================================
+        # ORDINARY KEY CONFIRMATION (V2)
+        # ============================================================
+
+        if message_type == "ordinary_key_confirmation":
+
+            if self.connection_mode != "ordinary":
+                return
+
+            session_id = message.get("session_id")
+
+            try:
+                result = (
+                    self.ordinary_authenticator
+                    .verify_client_key_confirmation(message)
+                )
+
+                await self.signaling.send(result)
+
+                self._cancel_auth_timeout()
                 self.authenticated = True
 
+                print(
+                    "[SECURITY] Ordinary V2 key confirmation PASS"
+                )
+                print(
+                    "[SECURITY] Ordinary V2 authentication COMPLETE"
+                )
                 print(
                     "[SECURITY] Starting WebRTC session"
                 )
@@ -639,19 +767,17 @@ class Agent:
                 self.authenticated = False
 
                 print(
-                    "[SECURITY] AUTH FAILED:",
+                    "[SECURITY] Ordinary V2 key confirmation FAILED:",
                     error
                 )
 
                 try:
                     await self.signaling.send(
                         {
-                            "type": "connection_auth_rejected",
-                            "version": 1,
-                            "connection_id": (
-                                self.connection_auth.connection_id
-                            ),
-                            "reason": "authentication_failed",
+                            "type": "ordinary_auth_rejected",
+                            "version": 2,
+                            "session_id": session_id,
+                            "reason": "key_confirmation_failed",
                         }
                     )
                 except Exception:
@@ -803,6 +929,34 @@ class Agent:
                 "type": "pc_info",
                 "pc_code": self.signaling.public_pc_code,
             }
+
+        if message_type == "get_trusted_devices":
+            print("[IPC] UI requested Trusted Devices")
+
+            try:
+                devices = self.trusted_devices.list_devices()
+
+                print(
+                    f"[IPC] Sending {len(devices)} Trusted Device(s) to UI"
+                )
+
+                return {
+                    "type": "trusted_devices",
+                    "devices": devices,
+                }
+
+            except Exception as error:
+                print(
+                    "[IPC] Failed to load Trusted Devices:",
+                    error,
+                )
+
+                return {
+                    "type": "trusted_devices",
+                    "success": False,
+                    "devices": [],
+                    "error": str(error),
+                }
 
         if message_type == "connection_response":
             if self._event_loop is not None:
