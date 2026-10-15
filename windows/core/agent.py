@@ -14,10 +14,11 @@ from security.common.identity import WindowsIdentity
 
 from security.ordinary.auth import OrdinaryAuthenticator
 from security.trusted.auth import AndroidAuthenticator
+from security.trusted.hardware_auth import HardwareWebRTCAuthenticator
 from security.trusted.trusted_pairing import TrustedPairingManager
 from security.trusted.pairing_qr import create_pairing_qr
 
-from webrtc.peer import PeerConnection
+from webrtc.peer_session import PeerConnection
 
 from ipc.server import WebSocketServer
 from security.trusted.pairing import TrustedDeviceStore
@@ -58,6 +59,9 @@ class Agent:
         #
         # Trusted devices must NOT be forced through the manual UI path.
         self.trusted_authenticator = AndroidAuthenticator()
+        # Stage 3 is a separate hardware-key proof over the WebRTC DataChannel.
+        self._stage3_authenticator: HardwareWebRTCAuthenticator | None = None
+        self._stage3_authorized = False
         self.ordinary_authenticator = OrdinaryAuthenticator(
             identity=self.windows_identity
         )
@@ -158,6 +162,8 @@ class Agent:
         )
 
         self.peer.on_text = self._handle_peer_text
+        self.peer.on_channel_open = self._on_peer_channel_open
+        self.peer.on_hardware_auth_message = self._handle_hardware_auth_message
 
         # ============================================================
         # PEER CLOSED CALLBACK
@@ -320,6 +326,8 @@ class Agent:
         self.authenticated = False
         self.pairing_mode = False
         self.connection_mode = "ordinary"
+        self._stage3_authenticator = None
+        self._stage3_authorized = False
         self._cancel_auth_timeout()
         self.ordinary_authenticator.clear()
 
@@ -599,11 +607,19 @@ class Agent:
                     "[SECURITY] Manual approval NOT required"
                 )
 
+                # Stage 3 starts only after the native DataChannel opens.
+                # Do not open video/audio/control gates after signaling V3 alone.
+                self._stage3_authenticator = HardwareWebRTCAuthenticator(
+                    expected_hardware_public=result.get("hardware_public")
+                )
+                self._stage3_authorized = False
+                self.peer.revoke_hardware_session()
                 await self.peer.create_offer()
-                self.peer.authorize_hardware_session()
 
             except Exception as error:
                 self.authenticated = False
+                self._stage3_authenticator = None
+                self._stage3_authorized = False
 
                 print(
                     "[SECURITY] Trusted Device authentication rejected:",
@@ -814,6 +830,83 @@ class Agent:
         await self.peer.handle_signaling(
             message
         )
+
+    # ================================================================
+    # STAGE 3: TRUSTED HARDWARE PROOF OVER NATIVE DATACHANNEL
+    # ================================================================
+
+    async def _on_peer_channel_open(self):
+        # Pairing and ordinary V2 sessions retain their existing flows.
+        if (
+            self.connection_mode != "trusted"
+            or not self.authenticated
+            or self._stage3_authenticator is None
+            or self._stage3_authorized
+        ):
+            return
+
+        try:
+            challenge = self._stage3_authenticator.begin()
+            sent = self.peer.send_text(
+                json.dumps(challenge, separators=(",", ":"))
+            )
+            if not sent:
+                raise RuntimeError("Native DataChannel rejected Stage 3 challenge")
+            print("[SECURITY] Stage 3 hardware challenge sent over native DataChannel")
+        except Exception as error:
+            print("[SECURITY] Stage 3 could not start:", error)
+            await self._reject_stage3("stage3_challenge_send_failed")
+
+    async def _handle_hardware_auth_message(self, text: str):
+        # This callback is wired by PeerConnection._dispatch_text, which
+        # consumes hw_auth_* messages before ordinary input/pairing handlers.
+        if (
+            self.connection_mode != "trusted"
+            or not self.authenticated
+            or self._stage3_authenticator is None
+            or self._stage3_authorized
+        ):
+            print("[SECURITY] Ignoring Stage 3 message outside an active Trusted session")
+            return
+
+        try:
+            message = json.loads(text)
+            result = self._stage3_authenticator.verify_response(message)
+            if result.get("status") != "AUTHORIZED":
+                raise RuntimeError("Stage 3 verifier did not authorize the device")
+
+            # Only the verified registered hardware key opens protected media.
+            self.peer.authorize_hardware_session()
+            self._stage3_authorized = True
+            self._stage3_authenticator = None
+            print("[SECURITY] Stage 3 hardware attestation PASS")
+            print("[SECURITY] Native video/control/cursor gates opened")
+        except Exception as error:
+            print("[SECURITY] Stage 3 hardware authentication FAILED:", error)
+            await self._reject_stage3("stage3_hardware_auth_failed")
+
+    async def _reject_stage3(self, reason: str):
+        self.authenticated = False
+        self._stage3_authorized = False
+        self._stage3_authenticator = None
+        try:
+            self.peer.revoke_hardware_session()
+        except Exception:
+            pass
+        try:
+            await self.signaling.send({
+                "type": "trusted_auth_rejected",
+                "version": 1,
+                "reason": reason,
+            })
+        except Exception:
+            pass
+        try:
+            await self.peer.stop_session()
+        except Exception as error:
+            print("[SECURITY] Failed to close rejected Stage 3 session:", error)
+        self._clear_connection_state()
+        print("[SECURITY] Trusted session closed: Stage 3 proof is mandatory")
 
     # ================================================================
     # DATACHANNEL TEXT

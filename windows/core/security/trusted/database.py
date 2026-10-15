@@ -80,9 +80,26 @@ class LazyPCDatabase:
             )
 
     def upsert_trusted_device(self, device: dict[str, Any]) -> None:
-        print("[DB] upsert_trusted_device received:")
-        for key, value in device.items():
-            print(f"[DB]   {key} = {value!r}")
+        # Never log key material, signatures, pairing nonces, or attestation
+        # challenges. Keep only non-secret diagnostic metadata.
+        safe_fields = (
+            "device_id",
+            "hardware_algorithm",
+            "hardware_security",
+            "algorithm",
+            "version",
+            "platform",
+            "manufacturer",
+            "model",
+            "android_version",
+        )
+        print("[DB] upsert_trusted_device received (sensitive fields redacted):")
+        for key in safe_fields:
+            value = device.get(key)
+            if value is not None:
+                if key == "device_id" and isinstance(value, str) and len(value) > 20:
+                    value = value[:12] + "..." + value[-4:]
+                print(f"[DB]   {key} = {value!r}")
         required = (
             "device_id",
             "pc_identity_public",

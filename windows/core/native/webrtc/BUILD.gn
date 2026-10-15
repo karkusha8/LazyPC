@@ -1,0 +1,28 @@
+import("//webrtc.gni")
+
+rtc_shared_library("lazypc_webrtc") {
+  sources = [
+    "native_peer.cc",
+    "native_peer.h",
+    "wasapi_loopback_audio.cc",
+    "wasapi_loopback_audio.h",
+  ]
+
+  deps = [
+    "//api:create_modular_peer_connection_factory",
+    "//api:enable_media_with_defaults",
+    "//api:peer_connection_interface",
+    "//api/video:video_frame",
+    "//modules/desktop_capture",
+    "//pc:video_track_source",
+    "//rtc_base:threading",
+    "//third_party/libyuv",
+  ]
+
+  if (is_win) {
+    libs = [
+      "ole32.lib",
+      "uuid.lib",
+    ]
+  }
+}

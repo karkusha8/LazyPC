@@ -470,11 +470,16 @@ class WebRTCClient(
          */
 
         peerConnection?.addTransceiver(
-
             MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-
             RtpTransceiver.RtpTransceiverInit(
+                RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
+            )
+        )
 
+        // Receive the system-audio track sent by the Windows native WebRTC peer.
+        peerConnection?.addTransceiver(
+            MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
+            RtpTransceiver.RtpTransceiverInit(
                 RtpTransceiver.RtpTransceiverDirection.RECV_ONLY
             )
         )
@@ -741,7 +746,10 @@ class WebRTCClient(
             val algorithm = json.optString("algorithm")
             val sessionId = json.optString("session_id")
             val challengeB64 = json.optString("challenge")
-
+            Log.i(
+                "LazyPC-Security",
+                "HW_AUTH challenge parsed: version=$version, algorithm=$algorithm"
+            )
             require(version == 1) { "Unsupported HW_AUTH version" }
             require(algorithm == "ECDSA-P256-HW-ATTESTATION") {
                 "Unsupported HW_AUTH algorithm"
