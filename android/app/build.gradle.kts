@@ -9,10 +9,11 @@ android {
 
     defaultConfig {
         applicationId = "com.example.lazypc"
-        minSdk = 29
+        minSdk = 33
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -67,4 +68,6 @@ dependencies {
 
     // Google ML Kit: system QR scanner (no CAMERA permission required)
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

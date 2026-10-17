@@ -4,6 +4,9 @@ import com.example.lazypc.ui.screens.HomeScreen
 import com.example.lazypc.ui.screens.ConnectByIdScreen
 import com.example.lazypc.ui.screens.RemoteSessionScreen
 import android.os.Bundle
+import android.hardware.biometrics.BiometricPrompt
+import android.os.CancellationSignal
+import android.content.DialogInterface
 import android.widget.Toast
 import android.content.ComponentName
 import android.content.ServiceConnection
@@ -14,6 +17,7 @@ import android.os.Looper
 import android.content.Intent
 import androidx.activity.compose.setContent
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AlertDialog
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -55,6 +59,7 @@ class MainActivity : AppCompatActivity() {
             "ws://192.168.0.148:8000/ws"
     }
 
+    private var pendingSecureLinkCodeAccepted: (() -> Unit)? = null
     private var webRtcService: WebRTCForegroundService? = null
     private var serviceBound = false
 
@@ -148,9 +153,9 @@ class MainActivity : AppCompatActivity() {
     private val pcStatusPoll = object : Runnable {
         override fun run() {
             if (!finishing && !sessionConnected && !simpleConnectionConnected) {
-                trustedPcs.forEach { pc ->
-                    webRtcService?.requestPcStatus(pc.pcCode)
-                }
+                // Secure Link v4 devices are identified by their pinned public key.
+                // The legacy numeric-code status polling does not apply to v4.
+
 
                 lifecycleHandler.postDelayed(this, 10_000L)
             }
@@ -257,13 +262,9 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 try {
-                    // Parse/validate now, then arm the already implemented
-                    // Trusted Pairing flow. The WebRTC DataChannel carries
-                    // the actual PAIR_HELLO / PAIR_RESPONSE exchange.
-                    TrustedPairing(
-                        this,
-                        SecurityKeyStore()
-                    ).parseQrPayload(payload)
+                    // Secure Link v4 uses the URI QR format and must not
+                    // be passed through the legacy pipe-delimited parser.
+                    com.example.lazypc.security.SecureLinkV4.parseQrPayload(payload)
 
                     service.connectTrustedPairingSession(payload)
 
@@ -568,7 +569,7 @@ class MainActivity : AppCompatActivity() {
 
                     onComputerClick = { pc ->
                         connectionState = ConnectionState.Connecting
-                        webRtcService?.connectTrusted(pc.pcCode)
+                        webRtcService?.connectTrusted(pc.pcIdentityPublic, pc.hardwareAlias)
                     },
 
                     onAddComputer = {
@@ -581,15 +582,10 @@ class MainActivity : AppCompatActivity() {
                         showConnectById = true
                     },
                     onDeleteComputer = { pc ->
-                        trustedPcStore.remove(pc.pcCode)
+                        trustedPcStore.remove(pc.pcIdentityPublic)
                         trustedPcs = trustedPcStore.list()
-
-                        pcOnline = pcOnline - pc.pcCode
-
-                        Log.d(
-                            TAG_APP,
-                            "🗑 Trusted PC removed locally: ${pc.pcCode}"
-                        )
+                        pcOnline = pcOnline - pc.pcIdentityPublic
+                        Log.d(TAG_APP, "🗑 Secure Link v4 trusted PC removed locally")
                     },
 
                     onSettingsClick = {
@@ -676,27 +672,136 @@ class MainActivity : AppCompatActivity() {
             }
         )
 
-        service.registerTrustedPcPairedCallback { pcCode, pcIdentityPublic ->
+        service.registerSecureLinkPairedCallback { pcIdentityPublic, hardwareAlias ->
             runOnUiThread {
-                trustedPcStore.addOrUpdate(
-                    pcCode = pcCode,
-                    pcIdentityPublic = pcIdentityPublic
-                )
-
+                trustedPcStore.addOrUpdate(pcIdentityPublic, hardwareAlias)
                 trustedPcs = trustedPcStore.list()
-
                 Toast.makeText(
                     this,
                     "Компьютер добавлен в доверенные",
                     Toast.LENGTH_SHORT
                 ).show()
+                // Pairing ends on Home. A session starts only after the user taps the PC.
+                sessionConnecting = false
+                sessionConnected = false
+                connectionState = ConnectionState.Disconnected
             }
         }
 
-        service.registerPcStatusCallback { pcCode, online ->
+        service.registerSecureLinkPairingCallback { code, signature, complete ->
             runOnUiThread {
-                pcOnline = pcOnline + (pcCode to online)
+                // Biometric authentication comes first. The SAS is shown only after
+                // StrongBox authorizes this signing operation; pair3 is withheld until
+                // Windows validates the manually entered code and sends code_ok.
+                pendingSecureLinkCodeAccepted = null
+                try {
+                    val prompt = BiometricPrompt.Builder(this)
+                        .setTitle("Подтвердить сопряжение LazyPC")
+                        .setSubtitle("Ключ устройства защищён StrongBox")
+                        .setDescription("Подтверди использование ключа, затем введи код на Windows")
+                        .setNegativeButton("Отмена", mainExecutor,
+                            DialogInterface.OnClickListener { _, _ ->
+                                pendingSecureLinkCodeAccepted = null
+                                complete(null)
+                            })
+                        .build()
+                    prompt.authenticate(
+                        BiometricPrompt.CryptoObject(signature),
+                        CancellationSignal(),
+                        mainExecutor,
+                        object : BiometricPrompt.AuthenticationCallback() {
+                            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                val authorizedSignature = result.cryptoObject?.signature
+                                if (authorizedSignature == null) {
+                                    Log.e(TAG_APP, "Secure Link biometric result did not contain a signing operation")
+                                    complete(null)
+                                    return
+                                }
+
+                                val codeDialog = AlertDialog.Builder(this@MainActivity)
+                                    .setTitle("Secure Link v4 — код сопряжения")
+                                    .setMessage("Введи этот код в окне LazyPC на компьютере:\n\n$code")
+                                    .setCancelable(false)
+                                    .setNegativeButton("Отмена") { _, _ ->
+                                        pendingSecureLinkCodeAccepted = null
+                                        complete(null)
+                                    }
+                                    .create()
+                                codeDialog.setOnDismissListener {
+                                    // Do not leave a stale authorization callback behind.
+                                    pendingSecureLinkCodeAccepted = null
+                                }
+                                codeDialog.show()
+                                pendingSecureLinkCodeAccepted = {
+                                    pendingSecureLinkCodeAccepted = null
+                                    if (codeDialog.isShowing) codeDialog.dismiss()
+                                    complete(authorizedSignature)
+                                }
+                                Log.i(TAG_APP, "Secure Link biometric authorized; SAS displayed, awaiting Windows code acceptance")
+                            }
+
+                            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                                pendingSecureLinkCodeAccepted = null
+                                Log.e(TAG_APP, "Secure Link biometric authentication failed: $errString")
+                                complete(null)
+                            }
+                        }
+                    )
+                } catch (error: Throwable) {
+                    pendingSecureLinkCodeAccepted = null
+                    Log.e(TAG_APP, "Could not start Secure Link biometric prompt", error)
+                    complete(null)
+                }
             }
+        }
+
+        service.registerSecureLinkCodeAcceptedCallback {
+            runOnUiThread {
+                val accept = pendingSecureLinkCodeAccepted
+                if (accept == null) {
+                    Log.e(TAG_APP, "Windows accepted code but biometric authorization/code dialog is not ready")
+                } else {
+                    accept.invoke()
+                }
+            }
+        }
+
+        service.registerSecureLinkAuthPrompt { signature, complete ->
+            runOnUiThread {
+                try {
+                    val prompt = BiometricPrompt.Builder(this)
+                        .setTitle("Подтвердить защищённое подключение LazyPC")
+                        .setSubtitle("StrongBox подтверждает доверенное устройство")
+                        .setDescription("Разреши этому ПК открыть защищённую сессию")
+                        .setNegativeButton("Отмена", mainExecutor,
+                            DialogInterface.OnClickListener { _, _ -> complete(null) })
+                        .build()
+                    prompt.authenticate(
+                        BiometricPrompt.CryptoObject(signature),
+                        CancellationSignal(),
+                        mainExecutor,
+                        object : BiometricPrompt.AuthenticationCallback() {
+                            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                complete(result.cryptoObject?.signature)
+                            }
+                            override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                                Log.e(TAG_APP, "Secure Link session biometric failed: $errString")
+                                complete(null)
+                            }
+                            override fun onAuthenticationFailed() {
+                                Log.w(TAG_APP, "Secure Link session biometric not recognized")
+                            }
+                        }
+                    )
+                } catch (error: Throwable) {
+                    Log.e(TAG_APP, "Could not start Secure Link session biometric prompt", error)
+                    complete(null)
+                }
+            }
+        }
+
+        service.registerPcStatusCallback { _, _ ->
+            // Legacy PC-code status events are unrelated to Secure Link v4 identities.
         }
 
         service.registerOrdinaryAuthCallback {

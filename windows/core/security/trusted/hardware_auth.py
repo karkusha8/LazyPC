@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from .attestation_verifier import AttestationError, verify_hardware_attestation
+from .attestation_verifier import (
+    AttestationError,
+    verify_attestation_chain,
+)
 
 
 PROTOCOL_VERSION = 1
@@ -178,7 +181,7 @@ class HardwareWebRTCAuthenticator:
             )
 
         try:
-            result = verify_hardware_attestation(
+            result = verify_attestation_chain(
                 hardware_public_b64=public_b64,
                 signature_b64=signature_b64,
                 session_id=pending.session_id,

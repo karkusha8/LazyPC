@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+
 import qrcode
 
-from security.trusted.trusted_pairing import TrustedPairingManager, PairingInvitation
+from security.trusted.trusted_pairing import PairingInvitation, TrustedPairingManager
 
 
 DEFAULT_QR_PATH = (
@@ -17,31 +18,31 @@ DEFAULT_QR_PATH = (
 
 def create_pairing_qr(
     manager: TrustedPairingManager,
-    output_path: str | Path = DEFAULT_QR_PATH,
+    output_path: "str | Path" = DEFAULT_QR_PATH,
 ) -> tuple[PairingInvitation, Path]:
-    """
-    Create one Trusted Device pairing invitation and render its QR.
+    """Create one pairing invitation and render its QR.
 
-    IMPORTANT:
-    The manager instance must be the same instance used by the running
-    Agent for PAIR_RESPONSE verification. The QR is only the visual
-    transport for the already-created one-time invitation.
+    The QR holds the pairing secret (PSK), so it must be shown only to the
+    person holding the phone, and deleted as soon as pairing ends. The
+    invitation's `session` is what must receive the pairing messages from
+    signaling (link_runner.run_pairing).
     """
     invitation = manager.begin()
-    payload = invitation.qr_payload()
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    image = qrcode.make(payload)
-    image.save(path)
+    qrcode.make(invitation.qr_payload()).save(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
     return invitation, path
 
 
-def delete_pairing_qr(path: str | Path = DEFAULT_QR_PATH) -> None:
-    path = Path(path)
+def delete_pairing_qr(path: "str | Path" = DEFAULT_QR_PATH) -> None:
     try:
-        path.unlink(missing_ok=True)
+        Path(path).unlink(missing_ok=True)
     except OSError:
         pass

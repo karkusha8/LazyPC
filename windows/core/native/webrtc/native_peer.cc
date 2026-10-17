@@ -48,12 +48,19 @@ std::unique_ptr<webrtc::Thread> g_network_thread;
 std::unique_ptr<webrtc::Thread> g_signaling_thread;
 std::unique_ptr<webrtc::WinsockInitializer> g_winsock_initializer;
 
+// Secure Link v4 carries SDP inside Noise messages, so local SDP must include
+// the complete ICE candidate set before it is returned to Python.
+std::mutex g_ice_gathering_mutex;
+std::condition_variable g_ice_gathering_cv;
+bool g_ice_gathering_complete = false;
+
 webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
     g_peer_connection_factory;
 
 webrtc::scoped_refptr<webrtc::PeerConnectionInterface> g_peer_connection;
 
 webrtc::scoped_refptr<webrtc::DataChannelInterface> g_control_channel;
+webrtc::scoped_refptr<webrtc::DataChannelInterface> g_auth_channel;
 
 webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> g_video_source;
 webrtc::scoped_refptr<webrtc::VideoTrackInterface> g_video_track;
@@ -251,30 +258,32 @@ class LazyDataChannelObserver : public webrtc::DataChannelObserver {
  public:
   explicit LazyDataChannelObserver(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> channel)
-      : channel_(std::move(channel)) {}
+      : channel_(std::move(channel)), label_(channel_->label()) {}
 
   ~LazyDataChannelObserver() override = default;
 
   void OnStateChange() override {
     const auto state = channel_->state();
 
-    PushEvent("datachannel_state",
+    PushEvent("datachannel_state_" + label_,
               webrtc::DataChannelInterface::DataStateString(state));
   }
 
   void OnMessage(const webrtc::DataBuffer& buffer) override {
     std::string data(buffer.data.data<char>(), buffer.data.size());
 
-    PushEvent("datachannel_message", std::move(data), buffer.binary);
+    PushEvent("datachannel_message_" + label_, std::move(data), buffer.binary);
   }
 
   void OnBufferedAmountChange(uint64_t /* previous_amount */) override {}
 
  private:
   webrtc::scoped_refptr<webrtc::DataChannelInterface> channel_;
+  const std::string label_;
 };
 
 std::unique_ptr<LazyDataChannelObserver> g_control_observer;
+std::unique_ptr<LazyDataChannelObserver> g_auth_observer;
 
 class LazyPeerConnectionObserver : public webrtc::PeerConnectionObserver {
  public:
@@ -296,17 +305,28 @@ class LazyPeerConnectionObserver : public webrtc::PeerConnectionObserver {
 
   void OnDataChannel(
       webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override {
-    if (channel->label() != "control") {
+    const std::string label = channel->label();
+    if (label == "control") {
+      if (g_control_channel) {
+        g_control_channel->UnregisterObserver();
+      }
+      g_control_channel = channel;
+      g_control_observer = std::make_unique<LazyDataChannelObserver>(channel);
+      channel->RegisterObserver(g_control_observer.get());
+      PushEvent("datachannel", "control");
       return;
     }
-
-    g_control_channel = channel;
-
-    g_control_observer = std::make_unique<LazyDataChannelObserver>(channel);
-
-    channel->RegisterObserver(g_control_observer.get());
-
-    PushEvent("datachannel", "control");
+    if (label == "auth") {
+      if (g_auth_channel) {
+        g_auth_channel->UnregisterObserver();
+      }
+      g_auth_channel = channel;
+      g_auth_observer = std::make_unique<LazyDataChannelObserver>(channel);
+      channel->RegisterObserver(g_auth_observer.get());
+      PushEvent("datachannel", "auth");
+      return;
+    }
+    // Unknown labels are deliberately ignored.
   }
 
   void OnRenegotiationNeeded() override { PushEvent("renegotiation_needed"); }
@@ -319,6 +339,13 @@ class LazyPeerConnectionObserver : public webrtc::PeerConnectionObserver {
 
   void OnIceGatheringChange(
       webrtc::PeerConnectionInterface::IceGatheringState new_state) override {
+    if (new_state == webrtc::PeerConnectionInterface::kIceGatheringComplete) {
+      {
+        std::lock_guard<std::mutex> lock(g_ice_gathering_mutex);
+        g_ice_gathering_complete = true;
+      }
+      g_ice_gathering_cv.notify_all();
+    }
     PushEvent("ice_gathering_state",
               std::to_string(static_cast<int>(new_state)));
   }
@@ -366,9 +393,14 @@ void CleanupControlChannel() {
   if (g_control_channel) {
     g_control_channel->UnregisterObserver();
   }
+  if (g_auth_channel) {
+    g_auth_channel->UnregisterObserver();
+  }
 
   g_control_observer.reset();
+  g_auth_observer.reset();
   g_control_channel = nullptr;
+  g_auth_channel = nullptr;
 }
 
 void CleanupThreads() {
@@ -542,6 +574,27 @@ char* DuplicateString(const std::string& value) {
   std::memcpy(result, value.data(), size + 1);
 
   return result;
+}
+
+bool WaitForIceGatheringComplete(int timeout_ms) {
+  std::unique_lock<std::mutex> lock(g_ice_gathering_mutex);
+  return g_ice_gathering_cv.wait_for(
+      lock, std::chrono::milliseconds(timeout_ms),
+      [] { return g_ice_gathering_complete; });
+}
+
+bool GetLocalDescriptionSdp(std::string* out_sdp) {
+  if (!out_sdp || !g_peer_connection || !g_signaling_thread) {
+    return false;
+  }
+  bool ok = false;
+  g_signaling_thread->BlockingCall([&]() {
+    const auto* description = g_peer_connection->local_description();
+    if (description) {
+      ok = description->ToString(out_sdp);
+    }
+  });
+  return ok;
 }
 
 bool SetLocalDescriptionInternal(const std::string& type,
@@ -1067,6 +1120,37 @@ int lazypc_webrtc_has_control_channel() {
   return g_control_channel ? 1 : 0;
 }
 
+int lazypc_webrtc_has_auth_channel() {
+  return g_auth_channel ? 1 : 0;
+}
+
+int lazypc_webrtc_auth_state() {
+  if (!g_auth_channel) {
+    return -1;
+  }
+  return static_cast<int>(g_auth_channel->state());
+}
+
+int lazypc_webrtc_send_auth(const void* data, size_t size, int binary) {
+  if (!g_auth_channel || !data || size == 0) {
+    return 0;
+  }
+  int result = 0;
+  std::string payload(static_cast<const char*>(data), size);
+  if (g_signaling_thread) {
+    g_signaling_thread->BlockingCall([&]() {
+      if (!g_auth_channel ||
+          g_auth_channel->state() != webrtc::DataChannelInterface::kOpen) {
+        return;
+      }
+      webrtc::CopyOnWriteBuffer buffer(payload.data(), payload.size());
+      webrtc::DataBuffer message(buffer, binary != 0);
+      result = g_auth_channel->Send(message) ? 1 : 0;
+    });
+  }
+  return result;
+}
+
 int lazypc_webrtc_create_offer(char** out_sdp) {
   if (!out_sdp || !g_peer_connection || !g_signaling_thread) {
     return 0;
@@ -1098,6 +1182,10 @@ int lazypc_webrtc_create_offer(char** out_sdp) {
 
   auto set_observer =
       webrtc::make_ref_counted<BlockingSetDescriptionObserver>();
+  {
+    std::lock_guard<std::mutex> lock(g_ice_gathering_mutex);
+    g_ice_gathering_complete = false;
+  }
 
   g_signaling_thread->BlockingCall(
       [description = std::move(description), set_observer]() mutable {
@@ -1107,6 +1195,14 @@ int lazypc_webrtc_create_offer(char** out_sdp) {
 
   if (!set_observer->Wait(&error)) {
     PushEvent("error", "set_local_offer:" + error);
+    return 0;
+  }
+  if (!WaitForIceGatheringComplete(15000)) {
+    PushEvent("error", "ice_gathering_timeout:offer");
+    return 0;
+  }
+  if (!GetLocalDescriptionSdp(&sdp)) {
+    PushEvent("error", "get_local_offer_sdp:failed");
     return 0;
   }
 
@@ -1145,6 +1241,10 @@ int lazypc_webrtc_create_answer(char** out_sdp) {
 
   auto set_observer =
       webrtc::make_ref_counted<BlockingSetDescriptionObserver>();
+  {
+    std::lock_guard<std::mutex> lock(g_ice_gathering_mutex);
+    g_ice_gathering_complete = false;
+  }
 
   g_signaling_thread->BlockingCall(
       [description = std::move(description), set_observer]() mutable {
@@ -1154,6 +1254,14 @@ int lazypc_webrtc_create_answer(char** out_sdp) {
 
   if (!set_observer->Wait(&error)) {
     PushEvent("error", "set_local_answer:" + error);
+    return 0;
+  }
+  if (!WaitForIceGatheringComplete(15000)) {
+    PushEvent("error", "ice_gathering_timeout:answer");
+    return 0;
+  }
+  if (!GetLocalDescriptionSdp(&sdp)) {
+    PushEvent("error", "get_local_answer_sdp:failed");
     return 0;
   }
 

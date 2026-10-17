@@ -15,6 +15,11 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 class WebRTCClient(
 
@@ -58,6 +63,8 @@ class WebRTCClient(
 
     private var dataChannel:
             DataChannel? = null
+    private var secureAuthChannel: DataChannel? = null
+    @Volatile var onSecureAuthText: ((String) -> Unit)? = null
 
     private var statsExecutor: ScheduledExecutorService? = null
 
@@ -207,6 +214,8 @@ class WebRTCClient(
 
         dataChannel?.close()
         dataChannel = null
+        secureAuthChannel?.close()
+        secureAuthChannel = null
 
         peerConnection?.close()
         peerConnection = null
@@ -312,6 +321,10 @@ class WebRTCClient(
                             "📡 DataChannel received"
                         )
 
+                        if (channel.label() == "auth") {
+                            attachSecureAuthChannel(channel)
+                            return
+                        }
                         dataChannel = channel
 
                         channel.registerObserver(
@@ -386,6 +399,11 @@ class WebRTCClient(
                                         "DATA",
                                         "📥 RX TEXT = $text"
                                     )
+
+                                    if (channel.label() == "auth") {
+                                        onSecureAuthText?.invoke(text)
+                                        return
+                                    }
 
                                     if (handleTrustedPairingChallenge(text)) {
                                         return
@@ -488,7 +506,33 @@ class WebRTCClient(
         resetDiagnostics()
         startVideoStatsLogging()
 
+        // Create the dedicated auth channel before making the offer. This creates
+        // the SCTP m-line; Windows may then create its control channel as answerer.
+        val authChannel = peerConnection?.createDataChannel("auth", DataChannel.Init())
+            ?: error("Could not create Secure Link auth DataChannel")
+        attachSecureAuthChannel(authChannel)
+
         return peerConnection!!
+    }
+
+    private fun attachSecureAuthChannel(channel: DataChannel) {
+        secureAuthChannel = channel
+        channel.registerObserver(object : DataChannel.Observer {
+            override fun onBufferedAmountChange(previousAmount: Long) {}
+            override fun onStateChange() {
+                Log.d("LazyPC-SecureLink", "Auth DataChannel state=${channel.state()}")
+            }
+            override fun onMessage(buffer: DataChannel.Buffer) {
+                if (buffer.binary) {
+                    Log.w("LazyPC-SecureLink", "Dropped binary frame on auth DataChannel")
+                    return
+                }
+                val bytes = ByteArray(buffer.data.remaining())
+                buffer.data.get(bytes)
+                val text = String(bytes, StandardCharsets.UTF_8)
+                onSecureAuthText?.invoke(text)
+            }
+        })
     }
 
     /*
@@ -899,6 +943,54 @@ class WebRTCClient(
         )
     }
 
+    /** Create an offer with complete ICE candidates for the Secure Link v4 Noise hello. */
+    suspend fun createSecureOffer(): String = withTimeout(20_000L) {
+        val pc = peerConnection ?: error("PeerConnection is not initialized")
+        val offer = suspendCancellableCoroutine<SessionDescription> { continuation ->
+            pc.createOffer(object : SdpObserver {
+                override fun onCreateSuccess(description: SessionDescription?) {
+                    if (description == null) continuation.resumeWithException(IllegalStateException("Empty SDP offer"))
+                    else continuation.resume(description)
+                }
+                override fun onCreateFailure(error: String?) = continuation.resumeWithException(IllegalStateException("createOffer failed: $error"))
+                override fun onSetSuccess() {}
+                override fun onSetFailure(error: String?) {}
+            }, MediaConstraints())
+        }
+        suspendCancellableCoroutine<Unit> { continuation ->
+            pc.setLocalDescription(object : SdpObserver {
+                override fun onSetSuccess() { continuation.resume(Unit) }
+                override fun onSetFailure(error: String?) = continuation.resumeWithException(IllegalStateException("setLocalDescription failed: $error"))
+                override fun onCreateSuccess(description: SessionDescription?) {}
+                override fun onCreateFailure(error: String?) {}
+            }, offer)
+        }
+        while (pc.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE) delay(50)
+        requireNotNull(pc.localDescription?.description) { "Local SDP offer unavailable after ICE gathering" }
+    }
+
+    /** Apply only the SDP answer decrypted from the authenticated Noise reply. */
+    suspend fun applySecureAnswer(sdp: String) {
+        require(sdp.isNotBlank()) { "Secure Link answer is empty" }
+        val pc = peerConnection ?: error("PeerConnection is not initialized")
+        suspendCancellableCoroutine<Unit> { continuation ->
+            pc.setRemoteDescription(object : SdpObserver {
+                override fun onSetSuccess() { continuation.resume(Unit) }
+                override fun onSetFailure(error: String?) = continuation.resumeWithException(IllegalStateException("Secure SDP answer rejected: $error"))
+                override fun onCreateSuccess(description: SessionDescription?) {}
+                override fun onCreateFailure(error: String?) {}
+            }, SessionDescription(SessionDescription.Type.ANSWER, sdp))
+        }
+    }
+
+    /** Send a Secure Link authorization response only over the dedicated auth channel. */
+    fun sendSecureAuthText(text: String): Boolean {
+        val channel = secureAuthChannel ?: return false
+        if (channel.state() != DataChannel.State.OPEN) return false
+        val bytes = text.toByteArray(StandardCharsets.UTF_8)
+        return channel.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))
+    }
+
     fun setRemoteOffer(
         sdp: String,
         onAnswer: (String) -> Unit
@@ -1061,6 +1153,8 @@ class WebRTCClient(
 
         dataChannel?.close()
         dataChannel = null
+        secureAuthChannel?.close()
+        secureAuthChannel = null
 
         peerConnection?.close()
         peerConnection = null

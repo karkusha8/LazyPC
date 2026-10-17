@@ -573,6 +573,21 @@ docs = ["shibuya (==2025.7.24)", "sphinx (==8.2.3)", "sphinx-copybutton (==0.5.2
 tests = ["numpy (==2.2.4) ; sys_platform == \"linux\" and python_version == \"3.13\"", "pillow (==11.3.0) ; sys_platform == \"linux\" and python_version == \"3.13\"", "pytest (==8.4.1)", "pytest-cov (==6.2.1)", "pytest-rerunfailures (==15.1)", "pyvirtualdisplay (==3.0) ; sys_platform == \"linux\""]
 
 [[package]]
+name = "noiseprotocol"
+version = "0.3.1"
+description = "Implementation of Noise Protocol Framework"
+optional = false
+python-versions = "~=3.5"
+groups = ["main"]
+files = [
+    {file = "noiseprotocol-0.3.1-py3-none-any.whl", hash = "sha256:2e1a603a38439636cf0ffd8b3e8b12cee27d368a28b41be7dbe568b2abb23111"},
+    {file = "noiseprotocol-0.3.1.tar.gz", hash = "sha256:b092a871b60f6a8f07f17950dc9f7098c8fe7d715b049bd4c24ee3752b90d645"},
+]
+
+[package.dependencies]
+cryptography = ">=2.8"
+
+[[package]]
 name = "numpy"
 version = "2.4.2"
 description = "Fundamental package for array computing in Python"
@@ -1750,4 +1765,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<4.0"
-content-hash = "ad8b0c574e1216e0bb7d0b87c538155d09b96709e31581d18403e2db4420fa8b"
+content-hash = "6975d3acc95879ba30e20c448797a7aabe53518883a86aa7315e3f2920b914e2"

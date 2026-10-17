@@ -27,6 +27,10 @@ class NativePeerConnection:
 
         self.on_text: Optional[Callable[[str], object]] = None
         self.on_bytes: Optional[Callable[[bytes], object]] = None
+        self.on_auth_text: Optional[Callable[[str], object]] = None
+        self.on_auth_bytes: Optional[Callable[[bytes], object]] = None
+        self.on_auth_open: Optional[Callable[[], object]] = None
+        self.on_auth_close: Optional[Callable[[], object]] = None
 
         # Receives a signaling-ready dict: candidate, sdpMid, sdpMLineIndex.
         self.on_ice_candidate: Optional[
@@ -148,7 +152,7 @@ class NativePeerConnection:
             self.native.create_offer
         )
 
-        print("[NATIVE-WEBRTC] Offer created")
+        print("[NATIVE-WEBRTC] Offer created with completed ICE gathering")
 
         return sdp
 
@@ -161,7 +165,7 @@ class NativePeerConnection:
             self.native.create_answer
         )
 
-        print("[NATIVE-WEBRTC] Answer created")
+        print("[NATIVE-WEBRTC] Answer created with completed ICE gathering")
 
         return sdp
 
@@ -306,8 +310,9 @@ class NativePeerConnection:
         # DataChannel state
         # ------------------------------------------------------------
 
-        if event_type == "datachannel_state":
+        if event_type in {"datachannel_state_control", "datachannel_state_auth"}:
             state = str(data)
+            is_auth = event_type.endswith("_auth")
 
             print(
                 "[NATIVE-WEBRTC] DataChannel state:",
@@ -322,16 +327,13 @@ class NativePeerConnection:
             # closed
             #
             if state == "open":
-                if self.on_data_open is not None:
-                    await self._invoke(
-                        self.on_data_open
-                    )
-
+                callback = self.on_auth_open if is_auth else self.on_data_open
+                if callback is not None:
+                    await self._invoke(callback)
             elif state == "closed":
-                if self.on_data_close is not None:
-                    await self._invoke(
-                        self.on_data_close
-                    )
+                callback = self.on_auth_close if is_auth else self.on_data_close
+                if callback is not None:
+                    await self._invoke(callback)
 
             return
 
@@ -339,21 +341,16 @@ class NativePeerConnection:
         # DataChannel message
         # ------------------------------------------------------------
 
-        if event_type == "datachannel_message":
-
+        if event_type in {"datachannel_message_control", "datachannel_message_auth"}:
+            is_auth = event_type.endswith("_auth")
             if binary:
-                if self.on_bytes is not None:
-                    await self._invoke(
-                        self.on_bytes,
-                        bytes(data),
-                    )
+                callback = self.on_auth_bytes if is_auth else self.on_bytes
+                if callback is not None:
+                    await self._invoke(callback, bytes(data))
             else:
-                if self.on_text is not None:
-                    await self._invoke(
-                        self.on_text,
-                        str(data),
-                    )
-
+                callback = self.on_auth_text if is_auth else self.on_text
+                if callback is not None:
+                    await self._invoke(callback, str(data))
             return
 
         # ------------------------------------------------------------

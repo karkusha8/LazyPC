@@ -2,269 +2,155 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 class LazyPCDatabase:
-    """Small synchronous SQLite database used for persistent LazyPC state."""
+    """Small synchronous SQLite database for persistent LazyPC state.
+
+    v4 keeps ONE row per paired phone: its Noise static public key (identity on
+    the wire) and its StrongBox public key (authorization). Only public keys
+    are stored. The old `trusted_devices` table (3 keys + binding signatures)
+    is left untouched; those pairings cannot be used by the v4 protocol and
+    must be redone, after which `drop_legacy()` removes the old table.
+    """
 
     DB_NAME = "lazypc.db"
+    TABLE = "trusted_phones"
+    LEGACY_TABLE = "trusted_devices"
 
-    def __init__(self) -> None:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if not local_app_data:
-            raise RuntimeError("LOCALAPPDATA is unavailable.")
-
-        self.root = Path(local_app_data) / "LazyPC"
+    def __init__(self, path: "str | Path | None" = None) -> None:
+        if path is None:
+            local = os.environ.get("LOCALAPPDATA")
+            if not local:
+                raise RuntimeError("LOCALAPPDATA is unavailable.")
+            path = Path(local) / "LazyPC" / self.DB_NAME
+        self.path = Path(path)
+        self.root = self.path.parent
         self.root.mkdir(parents=True, exist_ok=True)
-
-        self.path = self.root / self.DB_NAME
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            with conn:                      # commit / rollback
+                yield conn
+        finally:
+            conn.close()                    # `with conn` alone never closes
 
     def _initialize(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trusted_devices (
+        with self._tx() as c:
+            c.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.TABLE} (
                     device_id TEXT PRIMARY KEY,
-
-                    pc_identity_public TEXT NOT NULL,
-                    identity_public TEXT NOT NULL,
-                    device_public TEXT NOT NULL,
-                    hardware_public TEXT NOT NULL,
-
-                    identity_binding_signature TEXT NOT NULL,
-                    pairing_id TEXT NOT NULL,
-                    pairing_nonce TEXT NOT NULL,
-
-                    hardware_algorithm TEXT NOT NULL DEFAULT 'ECDSA-P256',
-                    hardware_security TEXT NOT NULL DEFAULT 'StrongBox',
-                    attestation_challenge TEXT,
-
-                    algorithm TEXT NOT NULL DEFAULT 'ECDSA-P256-TRUSTED-V3',
-                    version INTEGER NOT NULL DEFAULT 4,
-
+                    phone_static BLOB NOT NULL UNIQUE,
+                    hw_public BLOB NOT NULL,
+                    pc_static BLOB NOT NULL,
                     platform TEXT,
                     manufacturer TEXT,
                     model TEXT,
                     android_version TEXT,
-
                     display_name TEXT,
                     enabled INTEGER NOT NULL DEFAULT 1,
-
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_seen_at TEXT
                 )
                 """
             )
 
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_trusted_devices_identity
-                ON trusted_devices(identity_public)
-                """
-            )
-
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_trusted_devices_device_public
-                ON trusted_devices(device_public)
-                """
-            )
-
-    def upsert_trusted_device(self, device: dict[str, Any]) -> None:
-        # Never log key material, signatures, pairing nonces, or attestation
-        # challenges. Keep only non-secret diagnostic metadata.
-        safe_fields = (
-            "device_id",
-            "hardware_algorithm",
-            "hardware_security",
-            "algorithm",
-            "version",
-            "platform",
-            "manufacturer",
-            "model",
-            "android_version",
-        )
-        print("[DB] upsert_trusted_device received (sensitive fields redacted):")
-        for key in safe_fields:
-            value = device.get(key)
-            if value is not None:
-                if key == "device_id" and isinstance(value, str) and len(value) > 20:
-                    value = value[:12] + "..." + value[-4:]
-                print(f"[DB]   {key} = {value!r}")
-        required = (
-            "device_id",
-            "pc_identity_public",
-            "identity_public",
-            "device_public",
-            "hardware_public",
-            "identity_binding_signature",
-            "pairing_id",
-            "pairing_nonce",
-        )
-
-        if not all(device.get(key) for key in required):
-            raise ValueError("Incomplete Trusted Device database record.")
-
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO trusted_devices (
-                    device_id,
-                    pc_identity_public,
-                    identity_public,
-                    device_public,
-                    hardware_public,
-                    identity_binding_signature,
-                    pairing_id,
-                    pairing_nonce,
-                    hardware_algorithm,
-                    hardware_security,
-                    attestation_challenge,
-                    algorithm,
-                    version,
-                    platform,
-                    manufacturer,
-                    model,
-                    android_version,
-                    display_name,
-                    enabled,
-                    created_at,
-                    last_seen_at
-                )
-                VALUES (
-                    :device_id,
-                    :pc_identity_public,
-                    :identity_public,
-                    :device_public,
-                    :hardware_public,
-                    :identity_binding_signature,
-                    :pairing_id,
-                    :pairing_nonce,
-                    :hardware_algorithm,
-                    :hardware_security,
-                    :attestation_challenge,
-                    :algorithm,
-                    :version,
-                    :platform,
-                    :manufacturer,
-                    :model,
-                    :android_version,
-                    :display_name,
-                    :enabled,
-                    COALESCE(:created_at, CURRENT_TIMESTAMP),
-                    :last_seen_at
-                )
+    # ---------------------------------------------------------------- write
+    def add_phone(self, device: dict[str, Any]) -> None:
+        required = ("device_id", "phone_static", "hw_public", "pc_static")
+        if not all(device.get(k) for k in required):
+            raise ValueError("Incomplete trusted phone record.")
+        row = {k: device.get(k) for k in (
+            "device_id", "phone_static", "hw_public", "pc_static", "platform",
+            "manufacturer", "model", "android_version", "display_name")}
+        with self._tx() as c:
+            c.execute(
+                f"""
+                INSERT INTO {self.TABLE} (
+                    device_id, phone_static, hw_public, pc_static, platform,
+                    manufacturer, model, android_version, display_name)
+                VALUES (:device_id, :phone_static, :hw_public, :pc_static,
+                        :platform, :manufacturer, :model, :android_version,
+                        :display_name)
                 ON CONFLICT(device_id) DO UPDATE SET
-                    pc_identity_public = excluded.pc_identity_public,
-                    identity_public = excluded.identity_public,
-                    device_public = excluded.device_public,
-                    hardware_public = excluded.hardware_public,
-                    identity_binding_signature =
-                        excluded.identity_binding_signature,
-                    pairing_id = excluded.pairing_id,
-                    pairing_nonce = excluded.pairing_nonce,
-                    hardware_algorithm = excluded.hardware_algorithm,
-                    hardware_security = excluded.hardware_security,
-                    attestation_challenge = excluded.attestation_challenge,
-                    algorithm = excluded.algorithm,
-                    version = excluded.version,
-                    platform = COALESCE(excluded.platform, trusted_devices.platform),
-                    manufacturer = COALESCE(
-                        excluded.manufacturer,
-                        trusted_devices.manufacturer
-                    ),
-                    model = COALESCE(excluded.model, trusted_devices.model),
-                    android_version = COALESCE(
-                        excluded.android_version,
-                        trusted_devices.android_version
-                    ),
-                    display_name = COALESCE(
-                        excluded.display_name,
-                        trusted_devices.display_name
-                    ),
-                    enabled = excluded.enabled,
-                    last_seen_at = excluded.last_seen_at
+                    hw_public = excluded.hw_public,
+                    pc_static = excluded.pc_static,
+                    platform = COALESCE(excluded.platform, {self.TABLE}.platform),
+                    manufacturer = COALESCE(excluded.manufacturer,
+                                            {self.TABLE}.manufacturer),
+                    model = COALESCE(excluded.model, {self.TABLE}.model),
+                    android_version = COALESCE(excluded.android_version,
+                                               {self.TABLE}.android_version),
+                    enabled = 1
                 """,
-                device,
+                row,
             )
 
-    def get_trusted_device(
-        self,
-        identity_public: str,
-        device_public: str,
-    ) -> dict[str, Any] | None:
-        device_id = self.device_id(device_public)
+    def remove(self, device_id: str) -> bool:
+        with self._tx() as c:
+            return c.execute(
+                f"DELETE FROM {self.TABLE} WHERE device_id = ?", (device_id,)
+            ).rowcount > 0
 
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM trusted_devices
-                WHERE device_id = ?
-                  AND identity_public = ?
-                  AND device_public = ?
-                """,
-                (device_id, identity_public, device_public),
-            ).fetchone()
+    def set_enabled(self, device_id: str, enabled: bool) -> bool:
+        with self._tx() as c:
+            return c.execute(
+                f"UPDATE {self.TABLE} SET enabled = ? WHERE device_id = ?",
+                (1 if enabled else 0, device_id),
+            ).rowcount > 0
 
+    def mark_seen(self, device_id: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                f"UPDATE {self.TABLE} SET last_seen_at = CURRENT_TIMESTAMP "
+                "WHERE device_id = ?", (device_id,))
+
+    # ----------------------------------------------------------------- read
+    def find_by_static(self, phone_static: bytes) -> "dict[str, Any] | None":
+        with self._tx() as c:
+            row = c.execute(
+                f"SELECT * FROM {self.TABLE} WHERE phone_static = ?",
+                (phone_static,)).fetchone()
         return dict(row) if row is not None else None
 
-    def list_trusted_devices(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM trusted_devices
-                ORDER BY created_at ASC, device_id ASC
+    def list_phones(self) -> list[dict[str, Any]]:
+        """Return JSON-safe display fields for the UI, never raw key material.
+
+        Binary public keys remain available to the authentication path through
+        find_by_static(); they are intentionally excluded from this listing.
+        """
+        with self._tx() as c:
+            rows = c.execute(
+                f"""
+                SELECT device_id, platform, manufacturer, model, android_version,
+                       display_name, enabled, created_at, last_seen_at
+                FROM {self.TABLE}
+                ORDER BY created_at, device_id
                 """
             ).fetchall()
+        return [dict(r) for r in rows]
 
-        return [dict(row) for row in rows]
+    # --------------------------------------------------------------- legacy
+    def _legacy_exists(self, c: sqlite3.Connection) -> bool:
+        return c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (self.LEGACY_TABLE,)).fetchone() is not None
 
-    def remove_trusted_device(self, device_public: str) -> bool:
-        device_id = self.device_id(device_public)
+    def legacy_count(self) -> int:
+        with self._tx() as c:
+            if not self._legacy_exists(c):
+                return 0
+            return c.execute(f"SELECT COUNT(*) FROM {self.LEGACY_TABLE}").fetchone()[0]
 
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                DELETE FROM trusted_devices
-                WHERE device_id = ?
-                """,
-                (device_id,),
-            )
-
-        return cursor.rowcount > 0
-
-    def mark_trusted_device_seen(self, device_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE trusted_devices
-                SET last_seen_at = CURRENT_TIMESTAMP
-                WHERE device_id = ?
-                """,
-                (device_id,),
-            )
-
-    @staticmethod
-    def device_id(device_public: str) -> str:
-        import hashlib
-
-        digest = hashlib.sha256(
-            device_public.encode("ascii")
-        ).hexdigest()
-
-        return "android-" + digest[:24]
-
-
-# Backwards-compatible alias for code that wants a repository-style name.
-TrustedDeviceRepository = LazyPCDatabase
+    def drop_legacy(self) -> None:
+        with self._tx() as c:
+            c.execute(f"DROP TABLE IF EXISTS {self.LEGACY_TABLE}")

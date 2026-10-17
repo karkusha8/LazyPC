@@ -108,7 +108,7 @@ fun HomeScreen(
                 trustedPcs.forEach { pc ->
                     ComputerCard(
                         pc = pc,
-                        online = pcOnline[pc.pcCode] == true,
+                        online = pcOnline[pc.pcIdentityPublic] == true,
                         onClick = { selectedPc = pc }
                     )
                 }
@@ -125,8 +125,8 @@ fun HomeScreen(
     selectedPc?.let { pc ->
         ComputerActionSheet(
             pc = pc,
-            online = pcOnline[pc.pcCode] == true,
-            connecting = connectingPc?.pcCode == pc.pcCode,
+            online = pcOnline[pc.pcIdentityPublic] == true,
+            connecting = connectingPc?.pcIdentityPublic == pc.pcIdentityPublic,
             onDismiss = {
                 if (connectingPc == null) {
                     selectedPc = null
@@ -202,7 +202,7 @@ private fun ComputerCard(
                 Spacer(modifier = Modifier.height(3.dp))
 
                 Text(
-                    text = formatPcCode(pc.pcCode),
+                    text = pc.name,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.68f)
                 )
@@ -288,7 +288,7 @@ private fun ComputerActionSheet(
             Spacer(modifier = Modifier.height(4.dp))
 
             Text(
-                text = formatPcCode(pc.pcCode),
+                text = pc.name,
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f)
             )
@@ -304,54 +304,37 @@ private fun ComputerActionSheet(
 
             Spacer(modifier = Modifier.height(22.dp))
 
-            if (online) {
-                Button(
-                    onClick = onConnect,
-                    enabled = !connecting,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(54.dp),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    if (connecting) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.5.dp,
-                            color = MaterialTheme.colorScheme.onPrimary
-                        )
-                        Spacer(modifier = Modifier.size(10.dp))
-                        Text(
-                            text = "Подключение...",
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.Link,
-                            contentDescription = null
-                        )
-                        Spacer(modifier = Modifier.size(8.dp))
-                        Text(
-                            text = "Подключиться",
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            } else {
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant
-                ) {
+            Button(
+                onClick = onConnect,
+                enabled = !connecting,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                if (connecting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.5.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(modifier = Modifier.size(10.dp))
                     Text(
-                        text = "Компьютер сейчас недоступен",
-                        modifier = Modifier.padding(17.dp),
-                        textAlign = TextAlign.Center,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
+                        text = "Подключение...",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Link,
+                        contentDescription = null
+                    )
+                    Spacer(modifier = Modifier.size(8.dp))
+                    Text(
+                        text = "Подключиться",
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }
-
             if (!connecting) {
                 Spacer(modifier = Modifier.height(10.dp))
 
@@ -398,7 +381,7 @@ private fun DeleteComputerDialog(
         title = { Text("Удалить компьютер?") },
         text = {
             Text(
-                "Компьютер ${formatPcCode(pc.pcCode)} будет удалён из списка. " +
+                "${pc.name} будет удалён из списка. " +
                         "Для подключения его потребуется добавить снова."
             )
         },
@@ -419,14 +402,6 @@ private fun DeleteComputerDialog(
     )
 }
 
-private fun formatPcCode(value: String): String {
-    val digits = value.filter(Char::isDigit).take(9)
-    if (digits.length != 9) return value
-
-    return "${digits.substring(0, 3)} " +
-            "${digits.substring(3, 6)} " +
-            digits.substring(6, 9)
-}
 
 @Composable
 private fun AddComputerButton(onClick: () -> Unit) {

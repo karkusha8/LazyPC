@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -11,12 +12,15 @@ from engine.keyboard_state import KeyboardState
 
 from network.signaling import SignalingClient
 from security.common.identity import WindowsIdentity
+from security.common.pc_static import PcIdentity
 
 from security.ordinary.auth import OrdinaryAuthenticator
-from security.trusted.auth import AndroidAuthenticator
+from security.trusted.auth import SessionAuthenticator
 from security.trusted.hardware_auth import HardwareWebRTCAuthenticator
 from security.trusted.trusted_pairing import TrustedPairingManager
-from security.trusted.pairing_qr import create_pairing_qr
+from security.trusted.signaling_transport import SecureSignalingTransport
+from security.trusted.link_runner import run_pairing, serve_sessions
+from security.trusted.pairing_qr import create_pairing_qr, delete_pairing_qr
 
 from webrtc.peer_session import PeerConnection
 
@@ -37,7 +41,14 @@ class Agent:
 
         self.windows_identity = WindowsIdentity()
         self.windows_identity.ensure_created()
-        self.trusted_devices = TrustedDeviceStore()
+
+        # One persistent v4 Noise identity and one shared trusted-device store
+        # must be used by both pairing and session authentication.
+        self.pc_static_identity = PcIdentity()
+        self.pc_static_identity.ensure_created()
+        self.trusted_devices = TrustedDeviceStore(
+            pc_static_pub=self.pc_static_identity.public_bytes()
+        )
 
         self.pc_id = self.windows_identity.device_id()
 
@@ -47,6 +58,15 @@ class Agent:
                 self.pc_id,
             )
         )
+
+        # Secure Link v4 opaque-message transport adapter. The server must later
+        # relay messages of type "secure_link" unchanged; until then the v4
+        # runtime remains inactive and the adapter only buffers valid messages.
+        self.secure_transport = SecureSignalingTransport(self.signaling)
+        self._secure_sessions_task: asyncio.Task | None = None
+        self._secure_auth_timeout_task: asyncio.Task | None = None
+        self._active_secure_ctx = None
+        self._secure_session_busy = False
 
         # ============================================================
         # SECURITY
@@ -58,8 +78,12 @@ class Agent:
         #   OrdinaryAuthenticator -> Ordinary V2 manual/direct auth
         #
         # Trusted devices must NOT be forced through the manual UI path.
-        self.trusted_authenticator = AndroidAuthenticator()
-        # Stage 3 is a separate hardware-key proof over the WebRTC DataChannel.
+        self.trusted_authenticator = SessionAuthenticator(
+            identity=self.pc_static_identity,
+            store=self.trusted_devices,
+        )
+        # Retained temporarily for cleanup compatibility; v4 auth uses the
+        # signed transcript handled by SessionContext on the auth DataChannel.
         self._stage3_authenticator: HardwareWebRTCAuthenticator | None = None
         self._stage3_authorized = False
         self.ordinary_authenticator = OrdinaryAuthenticator(
@@ -69,7 +93,10 @@ class Agent:
         self.authenticated = False
         self.pairing_mode = False
         self.connection_mode = "ordinary"
-        self.pairing = TrustedPairingManager()
+        self.pairing = TrustedPairingManager(
+            identity=self.pc_static_identity,
+            store=self.trusted_devices,
+        )
 
         # ============================================================
         # UI APPROVAL
@@ -82,6 +109,13 @@ class Agent:
         self._pending_manual_connection_id: str | None = None
         self._pending_manual_device_id: str | None = None
         self._pending_manual_device: dict[str, str] | None = None
+
+        # Secure Link v4 Trusted Device enrollment approval.
+        self._pairing_task: asyncio.Task | None = None
+        self._pairing_session = None
+        self._pairing_qr_path: str | None = None
+        self._pairing_approval_future: asyncio.Future | None = None
+        self._pairing_approval_id: str | None = None
 
         # ============================================================
         # WEBRTC
@@ -164,6 +198,8 @@ class Agent:
         self.peer.on_text = self._handle_peer_text
         self.peer.on_channel_open = self._on_peer_channel_open
         self.peer.on_hardware_auth_message = self._handle_hardware_auth_message
+        self.peer.on_auth_channel_open = self._on_secure_auth_channel_open
+        self.peer.on_auth_message = self._handle_secure_auth_message
 
         # ============================================================
         # PEER CLOSED CALLBACK
@@ -179,6 +215,9 @@ class Agent:
         self._closed_event = asyncio.Event()
         self._stopping = False
         self._auth_timeout_task: asyncio.Task | None = None
+        # One cleanup task per disconnect. Native DataChannel and
+        # PeerConnection events can report the same disconnect independently.
+        self._session_cleanup_task: asyncio.Task | None = None
 
         # ============================================================
         # IPC
@@ -338,6 +377,169 @@ class Agent:
         self._pending_manual_device_id = None
         self._pending_manual_device = None
 
+        # Revoke the v4 session context whenever Agent state is reset.
+        timeout_task = self._secure_auth_timeout_task
+        self._secure_auth_timeout_task = None
+        if timeout_task is not None and not timeout_task.done():
+            timeout_task.cancel()
+        ctx = self._active_secure_ctx
+        self._active_secure_ctx = None
+        self._secure_session_busy = False
+        if ctx is not None:
+            try:
+                ctx._kill()
+            except Exception:
+                pass
+
+    # ================================================================
+    # SECURE LINK v4 SESSION RUNTIME
+    # ================================================================
+
+    async def _serve_secure_sessions(self):
+        """Run the v4 Noise session listener over the opaque room transport."""
+        while not self._stopping:
+            try:
+                await serve_sessions(
+                    self.trusted_authenticator,
+                    self.secure_transport,
+                    self._build_secure_answer,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print("[SECURITY] Secure Link session listener error:", error)
+                await asyncio.sleep(1.0)
+
+    async def _build_secure_answer(self, ctx) -> str:
+        """Create an answer for the offer that was decrypted from Noise."""
+        if self._secure_session_busy:
+            raise RuntimeError("a Trusted Device session is already active")
+
+        self._secure_session_busy = True
+        self._active_secure_ctx = ctx
+        self.authenticated = False
+        self._stage3_authorized = False
+        self.peer.revoke_hardware_session()
+        self._start_secure_auth_timeout(ctx, timeout=30.0)
+
+        try:
+            # The offer came only from SessionAuthenticator.accept(), i.e. from
+            # the authenticated Noise IK message for a registered phone.
+            # PeerConnection returns a fully gathered answer; link_runner then
+            # wraps it in the Noise reply before signaling transport sends it.
+            return await self.peer.receive_secure_offer(ctx.offer_sdp)
+        except Exception:
+            timeout_task = self._secure_auth_timeout_task
+            self._secure_auth_timeout_task = None
+            if timeout_task is not None and not timeout_task.done():
+                timeout_task.cancel()
+            self._active_secure_ctx = None
+            self._secure_session_busy = False
+            try:
+                ctx._kill()
+            except Exception:
+                pass
+            raise
+
+    async def _on_secure_auth_channel_open(self):
+        """Send the single-use StrongBox challenge only after DTLS is up."""
+        ctx = self._active_secure_ctx
+        if ctx is None or self.authenticated or self._stopping:
+            return
+
+        try:
+            # libwebrtc opens the SCTP DataChannel only after DTLS succeeds.
+            # Its DTLS implementation validates the presented certificate
+            # against the SHA-256 fingerprint in the remote SDP. That SDP was
+            # carried inside the Noise hello. The native API does not yet expose
+            # the negotiated remote certificate fingerprint for a second,
+            # independent comparison, so this relies on libwebrtc's DTLS check.
+            challenge = ctx.begin_auth(scope="session")
+            self._start_secure_auth_timeout(ctx, timeout=15.5)
+            sent = self.peer.send_auth_text(
+                json.dumps(challenge, separators=(",", ":"))
+            )
+            if not sent:
+                raise RuntimeError("native auth DataChannel rejected challenge")
+            print("[SECURITY] Secure Link v4 challenge sent on auth DataChannel")
+        except Exception as error:
+            print("[SECURITY] Secure Link authorization could not start:", error)
+            await self._reject_secure_session("auth_challenge_failed")
+
+    async def _handle_secure_auth_message(self, text: str):
+        ctx = self._active_secure_ctx
+        if ctx is None or self.authenticated or self._stopping:
+            return
+
+        try:
+            message = json.loads(text)
+            if not isinstance(message, dict):
+                raise ValueError("auth message must be an object")
+            result = self.trusted_authenticator.authorize(ctx, message)
+            if result.get("scope") != "session":
+                raise RuntimeError("unexpected authorization scope")
+
+            # The only point where protected actions become available.
+            self.authenticated = True
+            self._stage3_authorized = True
+            timeout_task = self._secure_auth_timeout_task
+            self._secure_auth_timeout_task = None
+            if timeout_task is not None and not timeout_task.done():
+                timeout_task.cancel()
+            self.peer.authorize_hardware_session()
+            self._cancel_auth_timeout()
+            # Android must not mark the session ready merely because an SDP
+            # track was negotiated; this authenticated ack confirms that the
+            # StrongBox transcript passed and the Windows media gate is open.
+            if not self.peer.send_auth_text(json.dumps(
+                    {"type": "auth_complete", "scope": "session"},
+                    separators=(",", ":"))):
+                raise RuntimeError("native auth DataChannel rejected completion acknowledgement")
+            print("[SECURITY] Secure Link v4 StrongBox authorization PASS")
+        except Exception as error:
+            print("[SECURITY] Secure Link v4 authorization FAILED:", error)
+            await self._reject_secure_session("auth_response_invalid")
+
+    def _start_secure_auth_timeout(self, ctx, timeout: float):
+        old = self._secure_auth_timeout_task
+        self._secure_auth_timeout_task = None
+        if old is not None and not old.done():
+            old.cancel()
+        self._secure_auth_timeout_task = asyncio.create_task(
+            self._secure_auth_timeout_watch(ctx, timeout),
+            name="lazypc-secure-link-v4-auth-timeout",
+        )
+
+    async def _secure_auth_timeout_watch(self, ctx, timeout: float):
+        try:
+            await asyncio.sleep(timeout)
+            if self._active_secure_ctx is ctx and not self.authenticated:
+                await self._reject_secure_session("authorization_timeout")
+        except asyncio.CancelledError:
+            pass
+
+    async def _reject_secure_session(self, reason: str):
+        self.authenticated = False
+        self._stage3_authorized = False
+        timeout_task = self._secure_auth_timeout_task
+        self._secure_auth_timeout_task = None
+        if timeout_task is not None and not timeout_task.done():
+            timeout_task.cancel()
+        self.peer.revoke_hardware_session()
+        ctx = self._active_secure_ctx
+        self._active_secure_ctx = None
+        self._secure_session_busy = False
+        if ctx is not None:
+            try:
+                ctx._kill()
+            except Exception:
+                pass
+        try:
+            await self.peer.stop_session()
+        except Exception as error:
+            print("[SECURITY] Secure Link cleanup error:", error)
+        print("[SECURITY] Secure Link session rejected:", reason)
+
     # ================================================================
     # SIGNALING / SECURITY
     # ================================================================
@@ -348,6 +550,18 @@ class Agent:
     ):
 
         message_type = message.get("type")
+
+        # Secure Link v4 is the only supported WebRTC session path. Never let
+        # plaintext create_session/SDP/ICE activate the legacy state machine.
+        if message_type in {"create_session", "offer", "answer", "candidate"}:
+            print(f"[SECURITY] Dropped legacy plaintext signaling type={message_type}")
+            return
+
+        # Route Secure Link v4 opaque messages to the per-room mailbox. These
+        # bytes are not SDP JSON and must never be passed to legacy handlers.
+        if message_type == "secure_link":
+            self.secure_transport.feed_message(message)
+            return
 
         # ============================================================
         # NEW SESSION
@@ -382,26 +596,13 @@ class Agent:
             # Pairing is independent from both Trusted and Ordinary.
             # Existing pairing/enrollment logic is intentionally preserved.
             if pairing_token:
-                try:
-                    self.pairing.accept_signaling_token(pairing_token)
-                    self.pairing_mode = True
-                    self.authenticated = True
-
-                    print(
-                        "[SECURITY] Trusted Device pairing session accepted"
-                    )
-                    print(
-                        "[SECURITY] Normal authentication bypassed ONLY for pairing"
-                    )
-
-                    await self.peer.create_offer()
-
-                except Exception as error:
-                    print(
-                        "[SECURITY] PAIRING SESSION REJECTED:",
-                        error
-                    )
-
+                # v4 pairing is driven by run_pairing() over opaque room bytes;
+                # a legacy signaling token is not accepted as pairing proof.
+                print(
+                    "[SECURITY] Rejected legacy pairing-token session; "
+                    "Secure Link v4 transport is required"
+                )
+                self._clear_connection_state()
                 return
 
             # ========================================================
@@ -530,35 +731,14 @@ class Agent:
             # Trusted AUTH V3 is entered only when Android explicitly
             # selected a saved Trusted PC.
             if self.connection_mode == "trusted":
-                trusted_challenge = (
-                    self.trusted_authenticator.challenge_payload()
-                )
-
+                # The old signaling challenge API was removed in Secure Link v4.
+                # SessionAuthenticator.accept() must receive the Noise hello
+                # from the v4 room transport instead.
                 print(
-                    "[SECURITY] Trusted connection requested"
+                    "[SECURITY] Trusted Device session requires Secure Link v4 "
+                    "Noise hello transport; legacy signaling auth is disabled"
                 )
-                print(
-                    "[SECURITY] Sending Trusted Device AUTH_CHALLENGE"
-                )
-
-                try:
-                    await self.signaling.send(
-                        trusted_challenge
-                    )
-                except Exception as error:
-                    print(
-                        "[SECURITY] Trusted AUTH_CHALLENGE send failed:",
-                        error,
-                    )
-                    self._clear_connection_state()
-                    return
-
-                self._start_auth_timeout()
-
-                print(
-                    "[SECURITY] Waiting for Trusted Device AUTH_RESPONSE"
-                )
-
+                self._clear_connection_state()
                 return
 
         # ============================================================
@@ -570,88 +750,12 @@ class Agent:
             and message.get("version") == 3
             and message.get("algorithm") == "ECDSA-P256-TRUSTED-V3"
         ):
-            if self.connection_mode != "trusted":
-                print(
-                    "[SECURITY] Ignoring Trusted Device AUTH_RESPONSE "
-                    "for non-Trusted session"
-                )
-                return
-
-
-            self._cancel_auth_timeout()
-
-            try:
-                result = (
-                    self.trusted_authenticator.verify_response(
-                        message
-                    )
-                )
-
-                self.authenticated = True
-                self.pairing_mode = False
-
-                print(
-                    "[SECURITY] Trusted Device authentication PASS"
-                )
-                print(
-                    "[SECURITY] Trusted device:",
-                    result["device_id"],
-                )
-                print(
-                    "[SECURITY] Trusted hardware key:",
-                    "registered"
-                    if result.get("hardware_public")
-                    else "not registered",
-                )
-                print(
-                    "[SECURITY] Manual approval NOT required"
-                )
-
-                # Stage 3 starts only after the native DataChannel opens.
-                # Do not open video/audio/control gates after signaling V3 alone.
-                self._stage3_authenticator = HardwareWebRTCAuthenticator(
-                    expected_hardware_public=result.get("hardware_public")
-                )
-                self._stage3_authorized = False
-                self.peer.revoke_hardware_session()
-                await self.peer.create_offer()
-
-            except Exception as error:
-                self.authenticated = False
-                self._stage3_authenticator = None
-                self._stage3_authorized = False
-
-                print(
-                    "[SECURITY] Trusted Device authentication rejected:",
-                    error,
-                )
-                print(
-                    "[SECURITY] Trusted connection rejected; "
-                    "manual approval is disabled for this session"
-                )
-
-                try:
-                    await self.signaling.send(
-                        {
-                            "type": "trusted_auth_rejected",
-                            "version": 1,
-                            "reason": "trusted_auth_failed",
-                        }
-                    )
-                except Exception:
-                    pass
-
-                try:
-                    await self.peer.stop_session()
-                except Exception:
-                    pass
-
-                self._clear_connection_state()
-
-                print(
-                    "[AGENT] Waiting for next client..."
-                )
-
+            # Fail closed: v3 signatures are not accepted by Secure Link v4.
+            print("[SECURITY] Rejected legacy Trusted Device v3 auth response")
+            self.authenticated = False
+            self.peer.revoke_hardware_session()
+            await self.peer.stop_session()
+            self._clear_connection_state()
             return
 
         # ============================================================
@@ -1060,24 +1164,27 @@ class Agent:
 
             return None
 
-        if message_type == "pairing_start":
-            print("[IPC] Pairing requested by UI")
+        if message_type == "pairing_code_response":
+            self._resolve_pairing_code(message)
+            return None
 
+        if message_type == "pairing_cancel":
+            task = self._pairing_task
+            if task is not None and not task.done():
+                task.cancel()
+            return None
+
+        if message_type == "pairing_start":
+            print("[IPC] Trusted Device pairing requested by UI")
             try:
                 result = self.start_pairing()
-
                 return {
                     "type": "pairing_qr",
                     "success": True,
                     "path": result["path"],
                 }
-
             except Exception as error:
-                print(
-                    "[IPC] Pairing start failed:",
-                    error
-                )
-
+                print("[SECURITY] Trusted Device pairing start failed:", error)
                 return {
                     "type": "pairing_qr",
                     "success": False,
@@ -1086,61 +1193,135 @@ class Agent:
 
         return None
 
-    def start_pairing(self):
-        # The QR MUST be created from this exact TrustedPairingManager
-        # instance. Its pending invitation is later verified when the
-        # Android client sends the pairing token through signaling.
+    def _resolve_pairing_code(self, message: dict) -> None:
+        future = self._pairing_approval_future
+        if future is None or future.done():
+            return
+        if message.get("pairing_id") != self._pairing_approval_id:
+            return
+        code = message.get("code")
+        if isinstance(code, str):
+            # IPC may be handled from a different thread than the asyncio loop.
+            loop = self._event_loop
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(
+                    self._set_pairing_code_result, future, code
+                )
 
-        qr_path = (
-            os.path.join(
-                os.environ.get(
-                    "LOCALAPPDATA",
-                    os.path.expanduser("~")
-                ),
-                "LazyPC",
-                "pairing",
-                "trusted_device_qr.png",
+    @staticmethod
+    def _set_pairing_code_result(future: asyncio.Future, code: str) -> None:
+        if not future.done():
+            future.set_result(code)
+
+    async def _enter_pairing_code(self, expected_sas: str) -> bool:
+        """Ask the local user to enter the code shown on Android.
+
+        The expected SAS is deliberately not sent to the UI. The Agent compares
+        the submitted value itself before allowing the phone to enroll.
+        """
+        if self._event_loop is None or self._stopping:
+            return False
+
+        future = self._event_loop.create_future()
+        pairing_id = str(uuid.uuid4())
+        self._pairing_approval_future = future
+        self._pairing_approval_id = pairing_id
+
+        try:
+            sent = await self.ipc.send({
+                "type": "pairing_code_prompt",
+                "pairing_id": pairing_id,
+                "digits": 6,
+            })
+            if not sent:
+                print("[SECURITY] Cannot show pairing code input: UI is disconnected")
+                return False
+
+            remaining = self._pairing_session.remaining() if self._pairing_session else 60.0
+            timeout = max(0.1, min(remaining, 90.0))
+            try:
+                entered = await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                print("[SECURITY] Trusted Device code entry timed out")
+                return False
+
+            if not isinstance(entered, str):
+                return False
+            accepted = hmac.compare_digest(entered.strip(), expected_sas)
+            if not accepted:
+                print("[SECURITY] Trusted Device SAS code mismatch")
+            else:
+                print("[SECURITY] Trusted Device SAS code accepted")
+            return accepted
+        finally:
+            if self._pairing_approval_future is future:
+                self._pairing_approval_future = None
+                self._pairing_approval_id = None
+
+    async def _run_pairing_invitation(self, session, qr_path: str) -> None:
+        current_task = asyncio.current_task()
+        result = None
+        reason = "timeout_or_rejected"
+        try:
+            result = await run_pairing(
+                session,
+                self.secure_transport,
+                self._enter_pairing_code,
             )
+            if result is not None:
+                reason = "paired"
+                print("[SECURITY] Trusted Device enrollment PASS:", result.device_id)
+            else:
+                print("[SECURITY] Trusted Device pairing ended without enrollment")
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
+        except Exception as error:
+            reason = "failed"
+            print("[SECURITY] Trusted Device pairing failed:", error)
+        finally:
+            delete_pairing_qr(qr_path)
+            if self._pairing_approval_future is not None:
+                future = self._pairing_approval_future
+                if not future.done():
+                    future.set_result(False)
+            if self._pairing_task is current_task:
+                self._pairing_task = None
+                self._pairing_session = None
+                self._pairing_qr_path = None
+            try:
+                await self.ipc.send({
+                    "type": "pairing_finished",
+                    "success": result is not None,
+                    "reason": reason,
+                })
+            except Exception:
+                pass
+
+    def start_pairing(self):
+        # Only one live QR/invitation may exist at a time.
+        if self._pairing_task is not None and not self._pairing_task.done():
+            raise RuntimeError("Trusted Device pairing is already active")
+        if self._stopping:
+            raise RuntimeError("Agent is stopping")
+
+        qr_path = os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+            "LazyPC", "pairing", "trusted_device_qr.png",
+        )
+        invitation, path = create_pairing_qr(self.pairing, qr_path)
+
+        self._pairing_session = invitation.session
+        self._pairing_qr_path = str(path)
+        self._pairing_task = asyncio.create_task(
+            self._run_pairing_invitation(invitation.session, str(path)),
+            name="lazypc-trusted-device-pairing",
         )
 
-        invitation, path = create_pairing_qr(
-            self.pairing,
-            qr_path,
-        )
-
-        # Tell the signaling server which Agent owns this short-lived
-        # pairing token. The QR format itself stays unchanged.
-        self._register_pairing_token(
-            invitation.token,
-            ttl_seconds=120,
-        )
-
-        print(
-            "[SECURITY] ========================================"
-        )
-        print(
-            "[SECURITY] TRUSTED DEVICE PAIRING MODE"
-        )
-        print(
-            "[SECURITY] Pairing session created"
-        )
-        print(
-            "[SECURITY] Expires in: 120 seconds"
-        )
-        print(
-            "[SECURITY] QR image:",
-            path
-        )
-        print(
-            "[SECURITY] QR payload generated"
-        )
-        print(
-            "[SECURITY] ========================================"
-        )
-
-        return {
-            "path": str(path),
-        }
+        print("[SECURITY] Secure Link v4 Trusted Device pairing started")
+        print("[SECURITY] Pairing invitation expires in 120 seconds")
+        print("[SECURITY] QR image:", path)
+        return {"path": str(path)}
 
     def _register_pairing_token(
             self,
@@ -1216,6 +1397,12 @@ class Agent:
 
         await self.signaling.connect()
 
+        if self._secure_sessions_task is None or self._secure_sessions_task.done():
+            self._secure_sessions_task = asyncio.create_task(
+                self._serve_secure_sessions(),
+                name="lazypc-secure-link-v4-sessions",
+            )
+
         print(
             "[AGENT] Waiting for client..."
         )
@@ -1260,10 +1447,18 @@ class Agent:
             data: bytes
     ):
 
+        # Pairing must never accept remote input. In Trusted mode, the peer's
+        # local gate is the source of truth: it opens only after successful
+        # Stage 3 verification (or successful StrongBox-backed enrollment).
         if self.pairing_mode:
-            print(
-                "[SECURITY] INPUT blocked during Trusted Device pairing"
-            )
+            print("[SECURITY] INPUT blocked during Trusted Device pairing")
+            return
+
+        if (
+            self.connection_mode == "trusted"
+            and not getattr(self.peer, "security_authorized", False)
+        ):
+            print("[SECURITY] INPUT blocked before Trusted Device Stage 3 authorization")
             return
 
         try:
@@ -1313,6 +1508,26 @@ class Agent:
         print(
             "[AGENT] Stopping"
         )
+
+        if self._pairing_task is not None:
+            self._pairing_task.cancel()
+            try:
+                await self._pairing_task
+            except asyncio.CancelledError:
+                pass
+            self._pairing_task = None
+        if self._pairing_qr_path:
+            delete_pairing_qr(self._pairing_qr_path)
+            self._pairing_qr_path = None
+
+        if self._secure_sessions_task is not None:
+            self._secure_sessions_task.cancel()
+            try:
+                await self._secure_sessions_task
+            except asyncio.CancelledError:
+                pass
+            self._secure_sessions_task = None
+        self.secure_transport.close()
 
         total = time.perf_counter()
 
@@ -1391,28 +1606,38 @@ class Agent:
     # PEER CLOSED
     # ================================================================
 
+    def _schedule_session_cleanup(self, reason: str):
+        """Schedule teardown outside the native WebRTC event callback.
+
+        NativePeerConnection.close() cancels and awaits its event-loop task.
+        Running teardown from that same task can therefore self-await/deadlock.
+        """
+        task = self._session_cleanup_task
+        if task is not None and not task.done():
+            return
+        self._session_cleanup_task = asyncio.create_task(
+            self._cleanup_session(reason),
+            name="lazypc-session-cleanup",
+        )
+
+    async def _cleanup_session(self, reason: str):
+        print(f"[AGENT] Cleaning up session: {reason}")
+        try:
+            self.keyboard_state.release_all()
+            self.peer.revoke_hardware_session()
+            self._clear_connection_state()
+            await self.peer.stop_session()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print("[AGENT] Session cleanup error:", repr(error))
+        finally:
+            print("[AGENT] Waiting for next client...")
+
     async def _on_session_close(self):
-
-        print(
-            "[AGENT] Client requested session close"
-        )
-
-        self.keyboard_state.release_all()
-
-        self._clear_connection_state()
-
-        await self.peer.stop_session()
-
-        print(
-            "[AGENT] Waiting for next client..."
-        )
+        print("[AGENT] Client requested session close")
+        self._schedule_session_cleanup("client requested close")
 
     async def _on_peer_closed(self):
-
-        print(
-            "[AGENT] Peer disconnected"
-        )
-
-        self.keyboard_state.release_all()
-
-        self._clear_connection_state()
+        print("[AGENT] Peer disconnected")
+        self._schedule_session_cleanup("peer disconnected")

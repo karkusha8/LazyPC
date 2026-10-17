@@ -1,0 +1,18 @@
+[package]
+name = "lazypc_noise"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lazypc_noise"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+snow = "=0.10.0"
+jni = "=0.21.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+panic = "unwind"

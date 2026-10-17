@@ -20,10 +20,22 @@ import com.example.lazypc.R
 import com.example.lazypc.network.WsClient
 import com.example.lazypc.webrtc.WebRTCClient
 import kotlinx.coroutines.Job
+import com.example.lazypc.security.SecureLinkV4
+import com.example.lazypc.security.SecureLinkNoiseKeyStore
+import com.example.lazypc.security.SecureLinkNoiseSession
+import com.example.lazypc.security.SecureLinkV4PairingHandshake
+import com.example.lazypc.security.SecureLinkStrongBox
+import java.security.Signature
+import android.util.Base64
+import com.example.lazypc.network.SecureLinkV4Signaling
 import org.json.JSONObject
 import org.webrtc.EglBase
 import org.webrtc.IceCandidate
 import org.webrtc.VideoTrack
+import java.nio.charset.StandardCharsets
+import java.security.KeyStore
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 
 
 class WebRTCForegroundService : Service() {
@@ -54,6 +66,7 @@ class WebRTCForegroundService : Service() {
     private var onSignalingState: ((Boolean) -> Unit)? = null
     private var onSessionState: ((Boolean, Boolean) -> Unit)? = null
     private var onTrustedPcPaired: ((String, String?) -> Unit)? = null
+    private var onSecureLinkPaired: ((String, String) -> Unit)? = null
     private var onDirectSessionState: ((Boolean, Boolean, String?) -> Unit)? = null
     private var onOrdinaryAuthRequired: (() -> Unit)? = null
     private var onPcStatus: ((String, Boolean) -> Unit)? = null
@@ -62,6 +75,8 @@ class WebRTCForegroundService : Service() {
     private var sessionConnected = false
     private var sessionGeneration = 0L
     private var sessionTimeoutJob: Job? = null
+    private var signalingReconnectJob: Job? = null
+    private var signalingRetryDelayMs = 2_000L
     private var directSessionTimeoutJob: Job? = null
 
     /*
@@ -71,6 +86,28 @@ class WebRTCForegroundService : Service() {
      */
     private var pendingPairingPayload: String? = null
     private var pendingPairingPcIdentityPublic: String? = null
+
+    // Secure Link v4 transport staging; separate from legacy pairing state.
+    private var pendingSecureLinkPairingRoom: ByteArray? = null
+    private var secureLinkV4Signaling: SecureLinkV4Signaling? = null
+    private var pendingSecureLinkInvitation: SecureLinkV4.Invitation? = null
+    private var secureLinkPairingHandshake: SecureLinkV4PairingHandshake? = null
+    private var secureLinkEnrollmentKey: SecureLinkStrongBox.EnrollmentKey? = null
+    private var secureLinkEnrollmentSignature: Signature? = null
+    private var secureLinkPair1Pending = false
+    private var secureSessionRoom: ByteArray? = null
+    private var secureSessionPcStatic: ByteArray? = null
+    private var secureSessionPhoneStatic: ByteArray? = null
+    private var secureSessionNoise: SecureLinkNoiseSession? = null
+    private var secureSessionHandshakeHash: ByteArray? = null
+    private var secureSessionFpPhone: ByteArray? = null
+    private var secureSessionFpPc: ByteArray? = null
+    private var secureSessionAlias: String? = null
+    private var secureSessionHelloPending = false
+    private var secureSessionAuthorized = false
+    private var onSecureLinkSas: ((String, Signature, (Signature?) -> Unit) -> Unit)? = null
+    private var onSecureLinkCodeAccepted: (() -> Unit)? = null
+    private var onSecureLinkAuthPrompt: ((Signature, (Signature?) -> Unit) -> Unit)? = null
 
     /*
      * ---------------------------------------------------------------------
@@ -132,6 +169,15 @@ class WebRTCForegroundService : Service() {
 
             onSignalingState?.invoke(connected)
 
+            if (!connected) {
+                scheduleSignalingReconnect()
+            }
+
+            if (!connected && secureSessionRoom != null) {
+                failSecureLinkSession("signaling disconnected")
+                return@setOnConnectionState
+            }
+
             if (!connected && sessionConnecting) {
                 failPendingSession(
                     "Signaling disconnected"
@@ -149,6 +195,11 @@ class WebRTCForegroundService : Service() {
             }
 
             if (connected) {
+                signalingReconnectJob?.cancel()
+                signalingReconnectJob = null
+                signalingRetryDelayMs = 2_000L
+
+                sendPendingSecureLinkSubscription()
 
                 /*
                  * There are three mutually exclusive signaling flows:
@@ -200,7 +251,15 @@ class WebRTCForegroundService : Service() {
             context = this,
             eglContext = eglBase.eglBaseContext,
 
-            onFrame = { track ->
+            onFrame = frameCallback@{ track ->
+
+                if (secureSessionRoom != null && !secureSessionAuthorized) {
+                    // The remote track may be negotiated before StrongBox auth.
+                    // Do not expose it to the UI until Windows opens its media gate.
+                    currentVideoTrack = track
+                    Log.d(TAG, "Secure Link video track negotiated; waiting for auth_complete")
+                    return@frameCallback
+                }
 
                 sessionTimeoutJob?.cancel()
                 sessionTimeoutJob = null
@@ -247,20 +306,9 @@ class WebRTCForegroundService : Service() {
             },
 
             onIce = { candidate ->
-
-                val json = JSONObject().apply {
-                    put("type", "candidate")
-                    put("candidate", candidate.sdp)
-                    put("sdpMid", candidate.sdpMid)
-                    put(
-                        "sdpMLineIndex",
-                        candidate.sdpMLineIndex
-                    )
-                }
-
-                ws.sendText(
-                    json.toString()
-                )
+                // Never send ICE candidates as plaintext signaling. Secure Link v4
+                // gathers them into SDP before the Noise-protected hello/reply.
+                Log.v(TAG, "ICE candidate gathered for protected SDP (${candidate.sdpMid})")
             },
 
             onCursorPosition = {
@@ -277,16 +325,42 @@ class WebRTCForegroundService : Service() {
             }
         )
 
+        webrtc.onSecureAuthText = { text -> handleSecureSessionAuthChallenge(text) }
         webrtc.init()
         webrtc.createPeerConnection()
 
-        /*
-         * IMPORTANT:
-         *
-         * Signaling is still NOT connected automatically.
-         *
-         * The user starts one of the connection models explicitly.
-         */
+        // Signaling is a background dependency of the app, not something that
+        // should wait until the user starts a remote session or scans a QR.
+        Log.i(TAG, "Connecting to signaling endpoint: $SIGNALING_URL")
+        ws.connect()
+    }
+
+    private fun scheduleSignalingReconnect() {
+        if (signalingReconnectJob?.isActive == true) return
+
+        signalingReconnectJob = serviceScope.launch {
+            while (true) {
+                val waitMs = signalingRetryDelayMs
+                Log.w(TAG, "Signaling is offline; retrying in ${waitMs}ms")
+                delay(waitMs)
+
+                if (!::ws.isInitialized) return@launch
+                if (ws.isOpen()) return@launch
+
+                try {
+                    ws.connect()
+                } catch (error: Throwable) {
+                    Log.e(TAG, "Could not start signaling reconnect", error)
+                }
+
+                signalingRetryDelayMs = (signalingRetryDelayMs * 2).coerceAtMost(30_000L)
+                // A failed WebSocket attempt invokes onConnectionState(false),
+                // which leaves this loop responsible for the next retry.
+                // If connect is still in progress, wait before checking again.
+                delay(1_000L)
+                if (ws.isOpen()) return@launch
+            }
+        }
     }
 
     override fun onStartCommand(
@@ -353,6 +427,28 @@ class WebRTCForegroundService : Service() {
         onTrustedPcPaired = callback
     }
 
+    /** Called after Secure Link v4 pairing is authenticated and persisted. */
+    fun registerSecureLinkPairedCallback(callback: (pcIdentityPublic: String, hardwareAlias: String) -> Unit) {
+        onSecureLinkPaired = callback
+    }
+
+    /** UI callback displays the SAS and completes StrongBox biometric signing. */
+    fun registerSecureLinkPairingCallback(
+        callback: (String, Signature, (Signature?) -> Unit) -> Unit
+    ) {
+        onSecureLinkSas = callback
+    }
+
+    /** Called only after the Windows UI accepted the SAS and its proof verified. */
+    fun registerSecureLinkCodeAcceptedCallback(callback: () -> Unit) {
+        onSecureLinkCodeAccepted = callback
+    }
+
+    /** UI must authenticate biometrically before the StrongBox session signature is used. */
+    fun registerSecureLinkAuthPrompt(callback: (Signature, (Signature?) -> Unit) -> Unit) {
+        onSecureLinkAuthPrompt = callback
+    }
+
     fun registerPcStatusCallback(
         callback: (String, Boolean) -> Unit
     ) {
@@ -396,48 +492,39 @@ class WebRTCForegroundService : Service() {
         onSignalingState = null
         onSessionState = null
         onTrustedPcPaired = null
+        onSecureLinkPaired = null
         onDirectSessionState = null
         onOrdinaryAuthRequired = null
+        onSecureLinkSas = null
+        onSecureLinkCodeAccepted = null
+        onSecureLinkAuthPrompt = null
+        onSecureLinkAuthPrompt = null
     }
 
     // =====================================================================
     // TRUSTED DEVICE CONNECTION
     // =====================================================================
 
-    fun connectTrusted(pcCode: String) {
-        val normalized = pcCode.filter { it.isDigit() }
-
-        if (normalized.length != 9) {
-            Log.e(TAG, "❌ Trusted connection rejected: PC code must be exactly 9 digits")
-            return
-        }
-
+    /** Start a Secure Link v4 session for a PC the user explicitly selected on Home. */
+    fun connectTrusted(pcIdentityPublic: String, hardwareAlias: String) {
         if (sessionConnecting || sessionConnected || directAttemptActive) {
-            Log.w(TAG, "Trusted connection requested while another session is active")
+            Log.w(TAG, "Secure Link v4 connect ignored: another session is active")
             return
         }
-
-        if (pendingPairingPayload != null) {
-            Log.w(TAG, "Trusted connection rejected: pairing is pending")
+        if (pcIdentityPublic.isBlank() || hardwareAlias.isBlank()) {
+            Log.e(TAG, "Secure Link v4 connect rejected: missing trusted identity or StrongBox alias")
             return
         }
-
-        pendingTrustedPcCode = normalized
-        trustedAttemptActive = true
-        sessionGeneration++
-        sessionConnecting = true
-        sessionConnected = false
-
-        onSessionState?.invoke(true, false)
-        startSessionTimeout(sessionGeneration)
-
-        val formatted = "${normalized.substring(0, 3)} ${normalized.substring(3, 6)} ${normalized.substring(6, 9)}"
-        Log.d(TAG, "▶ Connecting to Trusted PC: $formatted")
-
-        if (ws.isOpen()) {
-            sendPendingTrustedPcSelection()
-        } else {
-            ws.connect()
+        try {
+            val pcStatic = Base64.decode(
+                pcIdentityPublic,
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+            )
+            check(pcStatic.size == 32) { "Invalid pinned PC X25519 public key" }
+            Log.i(TAG, "User selected a trusted Secure Link v4 PC; starting authenticated session")
+            beginSecureLinkSession(pcStatic, hardwareAlias)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not start Secure Link v4 session", error)
         }
     }
 
@@ -462,41 +549,7 @@ class WebRTCForegroundService : Service() {
     // =====================================================================
 
     fun connectSession() {
-        if (
-            sessionConnecting ||
-            sessionConnected
-        ) {
-            return
-        }
-
-        sessionGeneration++
-
-        sessionConnecting = true
-        sessionConnected = false
-
-        onSessionState?.invoke(
-            sessionConnecting,
-            sessionConnected
-        )
-
-        startSessionTimeout(
-            sessionGeneration
-        )
-
-        Log.d(
-            TAG,
-            "▶ Starting LazyPC session"
-        )
-
-        /*
-         * If signaling is already OPEN, send create_session immediately.
-         * Otherwise onConnectionState(true) will send it after onOpen().
-         */
-        if (ws.isOpen()) {
-            sendNormalSession()
-        } else {
-            ws.connect()
-        }
+        Log.e(TAG, "Legacy create_session is disabled. Secure Link v4 is mandatory.")
     }
 
     /**
@@ -580,97 +633,8 @@ class WebRTCForegroundService : Service() {
      *        ↓
      *   existing WebRTC signaling
      */
-    fun connectToPc(
-        pcId: String
-    ) {
-        val normalizedPcId =
-            pcId.trim()
-
-        if (normalizedPcId.isBlank()) {
-            Log.e(
-                TAG,
-                "❌ Direct connection rejected: empty PC ID"
-            )
-            return
-        }
-
-        val isPublicPcCode =
-            normalizedPcId.length == 9 &&
-                    normalizedPcId.all { it.isDigit() }
-
-        if (!isPublicPcCode) {
-            Log.e(
-                TAG,
-                "❌ Direct connection rejected: PC code must be exactly 9 digits"
-            )
-            return
-        }
-
-        val formattedPcCode =
-            "${normalizedPcId.substring(0, 3)} " +
-                    "${normalizedPcId.substring(3, 6)} " +
-                    normalizedPcId.substring(6, 9)
-
-        if (
-            sessionConnecting ||
-            sessionConnected
-        ) {
-            Log.w(
-                TAG,
-                "Direct connection requested while session is active"
-            )
-            return
-        }
-
-        /*
-         * This model and Trusted Pairing must never be armed
-         * at the same time.
-         */
-        if (pendingPairingPayload != null) {
-            Log.w(
-                TAG,
-                "Direct connection rejected: Trusted pairing is pending"
-            )
-            return
-        }
-
-        pendingPcId = normalizedPcId
-        directAttemptActive = true
-        directConnected = false
-        directError = null
-
-        directSessionTimeoutJob?.cancel()
-        directSessionTimeoutJob = serviceScope.launch {
-            delay(ORDINARY_AUTH_TIMEOUT_MS)
-            if (directAttemptActive && !directConnected) {
-                failDirectConnection("Connection timeout")
-            }
-        }
-
-        onDirectSessionState?.invoke(
-            true,
-            false,
-            null
-        )
-
-        Log.d(
-            TAG,
-            "▶ Connecting directly to PC: $formattedPcCode"
-        )
-
-        /*
-         * If WebSocket is already fully OPEN, send find_pc now.
-         *
-         * If it is CONNECTING or completely closed, connect().
-         *
-         * We deliberately use isOpen(), not isConnected(),
-         * because socket != null may still mean CONNECTING.
-         */
-        if (ws.isOpen()) {
-            sendPendingPcSelection()
-        } else {
-            ws.connect()
-        }
+    fun connectToPc(pcId: String) {
+        Log.e(TAG, "Plain PC-ID WebRTC signaling is disabled. Secure Link v4 is mandatory.")
     }
 
     /**
@@ -794,46 +758,47 @@ class WebRTCForegroundService : Service() {
             return
         }
 
-        sessionGeneration++
+        // Secure Link v4 has a URI QR and room-based signaling. No legacy QR
+        // format is accepted by the new protocol.
+        if (!qrPayload.startsWith("lazypc://pair/4?")) {
+            Log.e(TAG, "Rejected legacy pairing QR: Secure Link v4 QR is required")
+            return
+        }
+        if (qrPayload.startsWith("lazypc://pair/4?")) {
+            try {
+                val invitation = SecureLinkV4.parseQrPayload(qrPayload)
+                clearSecureLinkPairing("new invitation")
+                pendingSecureLinkInvitation = invitation
+                pendingSecureLinkPairingRoom = invitation.pairingRoom()
+                secureLinkV4Signaling = SecureLinkV4Signaling(ws)
+                secureLinkPair1Pending = true
+                Log.i(TAG, "Secure Link v4 QR accepted; subscribing to pairing room")
+                if (ws.isOpen()) {
+                    sendPendingSecureLinkSubscription()
+                } else {
+                    ws.connect()
+                }
+            } catch (error: Exception) {
+                pendingSecureLinkPairingRoom = null
+                secureLinkV4Signaling = null
+                Log.e(TAG, "Secure Link v4 QR rejected", error)
+            }
+            return
+        }
 
-        sessionConnecting = true
-        sessionConnected = false
+        return
+    }
 
-        onSessionState?.invoke(
-            true,
-            false
-        )
-
-        startSessionTimeout(
-            sessionGeneration
-        )
-
-        /*
-         * Existing Trusted Pairing protocol.
-         *
-         * UNCHANGED.
-         */
-        webrtc.startTrustedPairing(
-            qrPayload
-        )
-
-        pendingPairingPayload =
-            qrPayload
-
-        pendingPairingPcIdentityPublic =
-            qrPayload.split('|')
-                .getOrNull(4)
-                ?.takeIf { it.isNotBlank() }
-
-        Log.d(
-            TAG,
-            "🔐 Starting Trusted Device pairing session"
-        )
-
-        if (ws.isOpen()) {
-            sendPendingPairingSession()
+    private fun sendPendingSecureLinkSubscription() {
+        if (!ws.isOpen()) return
+        val signaling = secureLinkV4Signaling ?: return
+        val pairRoom = pendingSecureLinkPairingRoom
+        val sessionRoom = secureSessionRoom
+        val room = pairRoom ?: sessionRoom ?: return
+        if (signaling.subscribe(room)) {
+            Log.i(TAG, if (pairRoom != null) "Secure Link v4 pairing room subscription sent" else "Secure Link v4 session room subscription sent")
         } else {
-            ws.connect()
+            Log.e(TAG, "Secure Link v4 room subscription could not be sent")
         }
     }
 
@@ -874,6 +839,319 @@ class WebRTCForegroundService : Service() {
                 false
             )
         }
+    }
+
+    private fun sendSecureLinkPair1() {
+        val invitation = pendingSecureLinkInvitation ?: return
+        val room = pendingSecureLinkPairingRoom ?: return
+        val signaling = secureLinkV4Signaling ?: return
+        if (!secureLinkPair1Pending || !ws.isOpen()) return
+        try {
+            val identity = SecureLinkNoiseKeyStore(this).loadOrCreate()
+            val handshake = try {
+                SecureLinkV4PairingHandshake(invitation, identity)
+            } finally {
+                identity.privateKey.fill(0)
+            }
+            val message = handshake.createPair1()
+            check(signaling.send(room, "pair1", message)) { "Could not send pair1" }
+            secureLinkPairingHandshake = handshake
+            secureLinkPair1Pending = false
+            Log.i(TAG, "Secure Link v4 pair1 sent (${message.size} bytes)")
+        } catch (error: Throwable) {
+            Log.e(TAG, "Secure Link v4 pair1 failed", error)
+            clearSecureLinkPairing("pair1 failed")
+        }
+    }
+
+    private fun handleSecureLinkPairingEnvelope(kind: String, data: ByteArray) {
+        val handshake = secureLinkPairingHandshake
+        val room = pendingSecureLinkPairingRoom
+        val signaling = secureLinkV4Signaling
+        if (handshake == null || room == null || signaling == null) {
+            Log.w(TAG, "Ignoring Secure Link $kind without an active pairing")
+            return
+        }
+        try {
+            when (kind) {
+                "pair2" -> {
+                    val code = handshake.receivePair2(data)
+                    val invitation = pendingSecureLinkInvitation ?: error("Invitation disappeared")
+                    val strongBox = SecureLinkStrongBox(this)
+                    val enrollment = strongBox.createFreshPairingKey(invitation.nonce)
+                    secureLinkEnrollmentKey = enrollment
+                    val transcript = handshake.pairingTranscript(enrollment)
+                    val prepareSignature = strongBox.prepareSignatureForBiometric(enrollment.alias)
+                    secureLinkEnrollmentSignature = prepareSignature
+                    val callback = onSecureLinkSas
+                    if (callback == null) error("Pairing UI is not attached; cannot display SAS or request biometric")
+                    callback(code, prepareSignature) { signedSignature ->
+                        serviceScope.launch(Dispatchers.IO) {
+                            try {
+                                if (signedSignature == null) error("Biometric signing cancelled")
+                                val signature = strongBox.finishSignature(signedSignature, transcript)
+                                val pair3 = handshake.createPair3(
+                                    enrollment, signature, Build.MANUFACTURER ?: "unknown",
+                                    Build.MODEL ?: "unknown", Build.VERSION.RELEASE ?: "unknown"
+                                )
+                                if (!signaling.send(room, "pair3", pair3)) error("Could not send pair3")
+                                Log.i(TAG, "Secure Link v4 pair3 sent (${pair3.size} bytes)")
+                            } catch (error: Throwable) {
+                                Log.e(TAG, "Secure Link v4 StrongBox enrollment failed", error)
+                                clearSecureLinkPairing("pair3 failed")
+                            } finally {
+                                transcript.fill(0)
+                            }
+                        }
+                    }
+                    Log.i(TAG, "Secure Link v4 pair2 accepted; StrongBox biometric authorized, awaiting Windows code acceptance")
+                }
+                "code_ok" -> {
+                    check(handshake.verifyCodeAcceptedProof(data)) {
+                        "Windows code-accepted proof is invalid"
+                    }
+                    Log.i(TAG, "Secure Link v4 Windows accepted the pairing code; biometric may start")
+                    onSecureLinkCodeAccepted?.invoke()
+                        ?: error("Pairing UI is not attached; cannot request biometric")
+                }
+                "pair4" -> {
+                    val paired = handshake.receivePair4(data)
+                    if (!paired) error("Windows rejected the pairing")
+                    val invitation = pendingSecureLinkInvitation ?: error("Invitation disappeared")
+                    val enrollment = secureLinkEnrollmentKey ?: error("Enrollment key missing")
+                    // Pin the PC Noise identity and StrongBox alias only after authenticated PAIRED.
+                    val saved = getSharedPreferences("secure_link_v4_trusted", MODE_PRIVATE).edit()
+                        .putString("pc_static_" + SecureLinkV4.b64UrlEncode(invitation.pcStaticPublic),
+                            SecureLinkV4.b64UrlEncode(invitation.pcStaticPublic))
+                        .putString("hw_alias_" + SecureLinkV4.b64UrlEncode(invitation.pcStaticPublic), enrollment.alias)
+                        .commit()
+                    check(saved) { "Could not persist trusted Secure Link device" }
+                    val pcStatic = SecureLinkV4.b64UrlEncode(invitation.pcStaticPublic)
+                    val alias = enrollment.alias
+                    Log.i(TAG, "Secure Link v4 pairing completed; PC identity pinned; returning to Home")
+                    // Notify the UI only after durable trust storage. Do not start Noise/WebRTC
+                    // or trigger the separate session biometric until the user selects this PC.
+                    onSecureLinkPaired?.invoke(pcStatic, alias)
+                        ?: Log.w(TAG, "Secure Link v4 paired, but Home UI callback is not attached")
+                    clearSecureLinkPairing("paired", preserveTrust = true)
+                }
+                else -> Log.w(TAG, "Ignoring unexpected Secure Link pairing kind=$kind")
+            }
+        } catch (error: Throwable) {
+            Log.e(TAG, "Secure Link v4 pairing message $kind failed", error)
+            clearSecureLinkPairing("$kind failed")
+        }
+    }
+
+    private fun beginSecureLinkSession(pcStaticPublic: ByteArray, hardwareAlias: String) {
+        if (sessionConnecting || sessionConnected || directAttemptActive) {
+            failSecureLinkSession("another session is already active")
+        }
+        sessionGeneration++
+        sessionConnecting = true
+        sessionConnected = false
+        onSessionState?.invoke(true, false)
+        startSessionTimeout(sessionGeneration)
+
+        secureSessionPcStatic = pcStaticPublic.copyOf()
+        secureSessionAlias = hardwareAlias
+        secureSessionRoom = SecureLinkV4.sessionRoom(pcStaticPublic)
+        secureLinkV4Signaling = SecureLinkV4Signaling(ws)
+        secureSessionHelloPending = true
+        secureSessionAuthorized = false
+        secureSessionPhoneStatic = null
+        secureSessionHandshakeHash = null
+        secureSessionFpPhone = null
+        secureSessionFpPc = null
+        secureSessionNoise?.close()
+        secureSessionNoise = null
+
+        try {
+            // Do not reuse any previous/legacy PeerConnection for a v4 session.
+            webrtc.resetPeerConnection()
+            if (ws.isOpen()) sendPendingSecureLinkSubscription() else ws.connect()
+            Log.i(TAG, "Secure Link v4 session started; waiting for secure room subscription")
+        } catch (error: Throwable) {
+            Log.e(TAG, "Could not initialize Secure Link v4 session", error)
+            failSecureLinkSession("WebRTC initialization failed")
+        }
+    }
+
+    private fun sendSecureSessionHello() {
+        if (!secureSessionHelloPending || !ws.isOpen()) return
+        val room = secureSessionRoom ?: return
+        val pcStatic = secureSessionPcStatic ?: return
+        val signaling = secureLinkV4Signaling ?: return
+        secureSessionHelloPending = false
+        serviceScope.launch(Dispatchers.IO) {
+            var identity: SecureLinkNoiseKeyStore.StaticIdentity? = null
+            var noise: SecureLinkNoiseSession? = null
+            try {
+                identity = SecureLinkNoiseKeyStore(this@WebRTCForegroundService).loadOrCreate()
+                val offer = webrtc.createSecureOffer()
+                val fpPhone = SecureLinkV4.sdpFingerprint(offer)
+                noise = SecureLinkNoiseSession.sessionInitiator(identity.privateKey, pcStatic)
+                val hello = JSONObject().apply {
+                    put("ts", System.currentTimeMillis() / 1000.0)
+                    put("sdp", offer)
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+                val message = noise.writeMessage(hello)
+                check(signaling.send(room, "hello", message)) { "Could not send secure hello" }
+                secureSessionPhoneStatic = identity.publicKey.copyOf()
+                secureSessionFpPhone = fpPhone
+                secureSessionNoise = noise
+                noise = null
+                Log.i(TAG, "Secure Link v4 Noise IK hello sent; SDP/ICE remained inside Noise")
+            } catch (error: Throwable) {
+                Log.e(TAG, "Secure Link v4 hello failed", error)
+                failSecureLinkSession("Noise hello failed")
+            } finally {
+                identity?.privateKey?.fill(0)
+                noise?.close()
+            }
+        }
+    }
+
+    private fun handleSecureLinkSessionEnvelope(kind: String, data: ByteArray) {
+        if (kind != "reply") {
+            Log.w(TAG, "Unexpected Secure Link session message kind=$kind")
+            return
+        }
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val noise = secureSessionNoise ?: error("No active Noise session")
+                val plain = noise.readMessage(data)
+                check(noise.isHandshakeFinished) { "Noise IK handshake did not finish" }
+                val answer = JSONObject(String(plain, StandardCharsets.UTF_8)).getString("sdp")
+                val fpPc = SecureLinkV4.sdpFingerprint(answer)
+                secureSessionHandshakeHash = noise.handshakeHash()
+                secureSessionFpPc = fpPc
+                webrtc.applySecureAnswer(answer)
+                Log.i(TAG, "Secure Link v4 Noise IK completed; authenticated SDP answer applied")
+            } catch (error: Throwable) {
+                Log.e(TAG, "Secure Link v4 reply rejected", error)
+                failSecureLinkSession("Noise reply or SDP answer invalid")
+            }
+        }
+    }
+
+    private fun handleSecureSessionAuthChallenge(text: String) {
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val msg = JSONObject(text)
+                when (msg.optString("type")) {
+                    "auth_complete" -> {
+                        require(msg.optString("scope") == "session") { "Unexpected auth completion scope" }
+                        secureSessionAuthorized = true
+                        sessionTimeoutJob?.cancel()
+                        sessionTimeoutJob = null
+                        sessionConnecting = false
+                        sessionConnected = true
+                        onSessionState?.invoke(false, true)
+                        currentVideoTrack?.let { onVideoTrackChanged?.invoke(it) }
+                        Log.i(TAG, "Secure Link v4 authorization confirmed; video is now visible")
+                        return@launch
+                    }
+                    "auth_challenge" -> Unit
+                    else -> error("Unexpected auth-channel message type")
+                }
+                val scope = msg.getString("scope")
+                require(scope == "session") { "Unsupported authorization scope" }
+                val nonce = Base64.decode(msg.getString("nonce"), Base64.DEFAULT)
+                val sessionId = Base64.decode(msg.getString("session_id"), Base64.DEFAULT)
+                require(nonce.size == 32 && sessionId.size == 16) { "Invalid auth challenge sizes" }
+                val handshakeHash = secureSessionHandshakeHash ?: error("Noise handshake hash missing")
+                val pcStatic = secureSessionPcStatic ?: error("PC identity missing")
+                val phoneStatic = secureSessionPhoneStatic ?: error("Phone identity missing")
+                val fpPhone = secureSessionFpPhone ?: error("Phone DTLS fingerprint missing")
+                val fpPc = secureSessionFpPc ?: error("PC DTLS fingerprint missing")
+                val alias = secureSessionAlias ?: error("StrongBox key alias missing")
+                val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                val hwDer = keyStore.getCertificate(alias)?.publicKey?.encoded ?: error("StrongBox public key unavailable")
+                val transcript = SecureLinkV4.sessionTranscript(scope, handshakeHash, pcStatic, phoneStatic, hwDer, fpPc, fpPhone, nonce, sessionId)
+                val signer = SecureLinkStrongBox(this@WebRTCForegroundService).prepareSignatureForBiometric(alias)
+                val callback = onSecureLinkAuthPrompt ?: error("Biometric UI is not attached")
+                withContext(Dispatchers.Main) {
+                    callback(signer) { authorizedSignature ->
+                        serviceScope.launch(Dispatchers.IO) {
+                            try {
+                                if (authorizedSignature == null) error("Biometric authorization cancelled")
+                                val signature = SecureLinkStrongBox(this@WebRTCForegroundService).finishSignature(authorizedSignature, transcript)
+                                val response = JSONObject().apply {
+                                    put("type", "auth_response")
+                                    put("scope", scope)
+                                    put("session_id", Base64.encodeToString(sessionId, Base64.NO_WRAP))
+                                    put("signature", Base64.encodeToString(signature, Base64.NO_WRAP))
+                                }
+                                check(webrtc.sendSecureAuthText(response.toString())) { "Auth DataChannel is not open" }
+                                Log.i(TAG, "Secure Link v4 StrongBox auth response sent")
+                            } catch (error: Throwable) {
+                                Log.e(TAG, "Secure Link v4 StrongBox authorization failed", error)
+                                failSecureLinkSession("StrongBox authorization failed")
+                            } finally {
+                                transcript.fill(0)
+                            }
+                        }
+                    }
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "Invalid Secure Link auth challenge", error)
+                failSecureLinkSession("Invalid auth challenge")
+            }
+        }
+    }
+
+    private fun failSecureLinkSession(reason: String) {
+        Log.e(TAG, "Secure Link v4 session failed: $reason")
+        secureSessionHelloPending = false
+        secureSessionAuthorized = false
+        secureSessionNoise?.close()
+        secureSessionNoise = null
+        secureSessionRoom?.fill(0)
+        secureSessionRoom = null
+        secureSessionPcStatic?.fill(0)
+        secureSessionPcStatic = null
+        secureSessionPhoneStatic?.fill(0)
+        secureSessionPhoneStatic = null
+        secureSessionHandshakeHash?.fill(0)
+        secureSessionHandshakeHash = null
+        secureSessionFpPhone = null
+        secureSessionFpPc = null
+        secureSessionAlias = null
+        try { webrtc.resetPeerConnection() } catch (_: Throwable) {}
+        if (sessionConnecting || sessionConnected) {
+            sessionConnecting = false
+            sessionConnected = false
+            sessionTimeoutJob?.cancel()
+            sessionTimeoutJob = null
+            currentVideoTrack = null
+            onVideoTrackChanged?.invoke(null)
+            onSessionState?.invoke(false, false)
+        }
+    }
+
+    private fun clearSecureLinkPairing(reason: String, preserveTrust: Boolean = false) {
+        Log.i(TAG, "Clearing Secure Link pairing state: $reason")
+        secureLinkPairingHandshake?.close()
+        secureLinkPairingHandshake = null
+        secureLinkEnrollmentSignature = null
+        if (!preserveTrust) {
+            secureLinkEnrollmentKey?.let { key ->
+                try { SecureLinkStrongBox(this).deletePairingKey(key.alias) }
+                catch (error: Throwable) { Log.w(TAG, "Could not remove failed pairing key", error) }
+            }
+        }
+        secureLinkEnrollmentKey = null
+        secureLinkPair1Pending = false
+        pendingSecureLinkPairingRoom?.fill(0)
+        pendingSecureLinkPairingRoom = null
+        pendingSecureLinkInvitation?.let {
+            it.psk.fill(0)
+            it.nonce.fill(0)
+            it.pcStaticPublic.fill(0)
+        }
+        pendingSecureLinkInvitation = null
+        secureLinkV4Signaling = null
     }
 
     // =====================================================================
@@ -920,6 +1198,10 @@ class WebRTCForegroundService : Service() {
     private fun failPendingSession(
         reason: String
     ) {
+        if (secureSessionRoom != null) {
+            failSecureLinkSession(reason)
+            return
+        }
         if (!sessionConnecting) {
             return
         }
@@ -941,6 +1223,10 @@ class WebRTCForegroundService : Service() {
          */
         pendingPairingPayload = null
         pendingPairingPcIdentityPublic = null
+        clearSecureLinkPairing("service destroyed")
+        onSecureLinkSas = null
+        onSecureLinkCodeAccepted = null
+        onSecureLinkAuthPrompt = null
         pendingPcId = null
 
         sessionGeneration++
@@ -980,6 +1266,12 @@ class WebRTCForegroundService : Service() {
 
     fun disconnectSession() {
 
+        if (secureSessionRoom != null) {
+            failSecureLinkSession("user disconnected")
+            ws.close()
+            return
+        }
+
         if (
             !sessionConnecting &&
             !sessionConnected &&
@@ -995,6 +1287,10 @@ class WebRTCForegroundService : Service() {
 
         pendingPairingPayload = null
         pendingPairingPcIdentityPublic = null
+        clearSecureLinkPairing("service destroyed")
+        onSecureLinkSas = null
+        onSecureLinkCodeAccepted = null
+        onSecureLinkAuthPrompt = null
         pendingPcId = null
 
         val generationAtDisconnect =
@@ -1149,9 +1445,41 @@ class WebRTCForegroundService : Service() {
             val json =
                 JSONObject(text)
 
+            if (json.optString("type") in setOf("offer", "answer", "candidate")) {
+                Log.e(TAG, "Dropped plaintext SDP/ICE signaling; Secure Link v4 is mandatory")
+                return
+            }
+
             when (
                 json.optString("type")
             ) {
+                "secure_link" -> {
+                    val envelope = secureLinkV4Signaling?.parseIncoming(text)
+                    val pairRoom = pendingSecureLinkPairingRoom
+                    val sessionRoom = secureSessionRoom
+                    when {
+                        envelope == null -> Log.w(TAG, "Dropped malformed Secure Link v4 envelope")
+                        pairRoom != null && pairRoom.contentEquals(envelope.room) -> handleSecureLinkPairingEnvelope(envelope.kind, envelope.data)
+                        sessionRoom != null && sessionRoom.contentEquals(envelope.room) -> handleSecureLinkSessionEnvelope(envelope.kind, envelope.data)
+                        else -> Log.w(TAG, "Dropped Secure Link v4 message for an unexpected room")
+                    }
+                    return
+                }
+
+                "secure_link_subscribe_result" -> {
+                    val ok = json.optBoolean("ok", false)
+                    val roomText = json.optString("room")
+                    Log.i(TAG, "Secure Link v4 room subscription result: $ok room=$roomText")
+                    if (!ok) {
+                        if (pendingSecureLinkPairingRoom != null) clearSecureLinkPairing("pairing room subscription rejected")
+                        if (secureSessionRoom != null) failSecureLinkSession("session room subscription rejected")
+                    } else if (secureLinkPair1Pending && pendingSecureLinkPairingRoom?.let { SecureLinkV4.b64UrlEncode(it) == roomText } == true) {
+                        sendSecureLinkPair1()
+                    } else if (secureSessionHelloPending && secureSessionRoom?.let { SecureLinkV4.b64UrlEncode(it) == roomText } == true) {
+                        sendSecureSessionHello()
+                    }
+                    return
+                }
 
                 "trusted_pc_selected" -> {
                     Log.d(
@@ -1449,12 +1777,18 @@ class WebRTCForegroundService : Service() {
 
         pendingPairingPayload = null
         pendingPairingPcIdentityPublic = null
+        clearSecureLinkPairing("service destroyed")
+        onSecureLinkSas = null
+        onSecureLinkCodeAccepted = null
+        onSecureLinkAuthPrompt = null
         pendingPcId = null
         pendingTrustedPcCode = null
         trustedAttemptActive = false
 
         sessionTimeoutJob?.cancel()
         sessionTimeoutJob = null
+        signalingReconnectJob?.cancel()
+        signalingReconnectJob = null
         directSessionTimeoutJob?.cancel()
         directSessionTimeoutJob = null
 

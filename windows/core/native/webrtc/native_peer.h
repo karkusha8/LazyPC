@@ -24,6 +24,12 @@ LAZYPC_API int lazypc_webrtc_set_audio_enabled(int enabled);
 
 LAZYPC_API int lazypc_webrtc_create_control_channel();
 LAZYPC_API int lazypc_webrtc_has_control_channel();
+LAZYPC_API int lazypc_webrtc_has_auth_channel();
+LAZYPC_API int lazypc_webrtc_send_auth(
+    const void* data,
+    size_t size,
+    int binary);
+LAZYPC_API int lazypc_webrtc_auth_state();
 
 LAZYPC_API int lazypc_webrtc_create_offer(char** out_sdp);
 LAZYPC_API int lazypc_webrtc_create_answer(char** out_sdp);

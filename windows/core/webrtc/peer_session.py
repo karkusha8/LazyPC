@@ -30,6 +30,7 @@ class PeerConnection:
         self._started = False
         self._closing = False
         self._stopping = False
+        self._disconnect_notified = False
         self._remote_description_set = False
         self._pending_remote_candidates: list[dict] = []
         self._pending_local_candidates: list[dict] = []
@@ -44,11 +45,16 @@ class PeerConnection:
         self.on_session_close: Callable | None = None
         self.on_channel_open: Callable | None = None
         self.on_hardware_auth_message: Callable | None = None
+        self.on_auth_channel_open: Callable | None = None
+        self.on_auth_message: Callable | None = None
 
     def _new_transport(self) -> NativePeerConnection:
         transport = NativePeerConnection(self.dll_path)
         transport.on_text = self._dispatch_text
         transport.on_bytes = self._dispatch_bytes
+        transport.on_auth_text = self._dispatch_auth_text
+        transport.on_auth_bytes = self._dispatch_auth_bytes
+        transport.on_auth_open = self._on_auth_channel_open
         transport.on_data_open = self._on_channel_open
         transport.on_data_close = self._on_channel_close
         transport.on_ice_candidate = self._on_local_candidate
@@ -63,47 +69,63 @@ class PeerConnection:
             self._started = True
         return self._transport
 
-    async def _dispatch_text(self, text: str):
-        """Preserve the legacy DataChannel control protocol.
+    async def _dispatch_auth_text(self, text: str):
+        # The dedicated auth channel is the only pre-authorization ingress for
+        # the Secure Link v4 challenge/response. It never reaches Agent's
+        # general command handler.
+        if self.on_auth_message is not None:
+            await self._call(self.on_auth_message, text)
 
-        Hardware-auth messages are routed to the dedicated Stage 3 handler
-        and must not fall through to ordinary control/input handling.
+    async def _dispatch_auth_bytes(self, data: bytes):
+        # Secure Link v4 auth messages are structured text. Drop binary frames.
+        print("[SECURITY] Dropped binary frame on Trusted Device auth channel")
+
+    async def _on_auth_channel_open(self):
+        print("[NATIVE-WEBRTC] Trusted Device auth channel opened")
+        if self.on_auth_channel_open is not None:
+            await self._call(self.on_auth_channel_open)
+
+    async def receive_secure_offer(self, sdp: str) -> str:
+        """Accept SDP obtained only from an authenticated/decrypted Noise hello.
+
+        Returns a fully gathered answer SDP; caller must wrap it in the Noise
+        reply before sending it through its transport.
         """
-        try:
-            control = json.loads(text)
-        except (TypeError, json.JSONDecodeError):
-            control = None
+        if not isinstance(sdp, str) or not sdp.strip():
+            raise ValueError("Secure Link offer SDP is empty")
+        if self._stopping:
+            raise RuntimeError("cannot accept an offer while the previous session is stopping")
+        self._disconnect_notified = False
+        transport = await self._ensure_started()
+        self._remote_description_set = False
+        await transport.set_remote_description("offer", sdp)
+        self._remote_description_set = True
+        # Android creates the dedicated auth channel before its offer. Windows
+        # creates only the control channel; both channels are then negotiated
+        # on the same SCTP m-line without exposing authorization to commands.
+        transport.create_control_channel()
+        answer = await transport.create_answer()
+        return answer
 
-        # Match peer.py: hw_auth_* is handled separately and returns early.
-        if (
-            isinstance(control, dict)
-            and str(control.get("type", "")).startswith("hw_auth_")
-        ):
-            if self.on_hardware_auth_message is not None:
-                await self._call(self.on_hardware_auth_message, text)
-            else:
-                print(
-                    "[SECURITY] Received hw_auth_* message, but "
-                    "on_hardware_auth_message is not configured"
-                )
+    async def _dispatch_text(self, text: str):
+        """Control channel is deaf until the Trusted Device session is authorized.
+
+        All pre-authorization protocol traffic belongs on the dedicated `auth`
+        channel. No pairing, liveness, close, or command message received on
+        `control` is acted upon before the v4 authorization gate opens.
+        """
+        if not self.security_authorized:
+            print("[SECURITY] Dropped control-channel text before Trusted Device authorization")
             return
-
-        # Preserve graceful remote shutdown behavior.
-        if text == "SESSION_CLOSE":
-            print("[NATIVE-WEBRTC] Remote requested session close")
-            if self.on_session_close is not None:
-                asyncio.create_task(self._call(self.on_session_close))
-            return
-
-        # Preserve the legacy DataChannel liveness response.
-        if text == "PING":
-            if self.send_text("PONG"):
-                print("[NATIVE-WEBRTC][DATA] TX -> PONG")
-
         if self.on_text is not None:
             await self._call(self.on_text, text)
 
     async def _dispatch_bytes(self, data: bytes):
+        # Binary DataChannel packets are used for input/control. Never pass them
+        # to Agent until Stage 3 (or the enrollment StrongBox proof) succeeded.
+        if not self.security_authorized:
+            print("[SECURITY] Dropped binary DataChannel packet before Trusted Device authorization")
+            return
         if self.on_bytes is not None:
             await self._call(self.on_bytes, data)
 
@@ -114,8 +136,27 @@ class PeerConnection:
         # Cursor sync is started only after explicit Stage 3 authorization.
         self._start_cursor_sync_if_allowed()
 
+    async def _notify_disconnected(self, source: str):
+        # Ignore close events emitted by our own teardown and collapse multiple
+        # native signals for the same connection into one Agent notification.
+        if self._stopping or self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        self.security_authorized = False
+        self._stop_cursor_sync()
+        transport = self._transport
+        if transport is not None and self._started:
+            try:
+                await asyncio.to_thread(transport.native.set_video_enabled, False)
+            except Exception as exc:
+                print("[NATIVE-WEBRTC] Failed to close video gate:", exc)
+        print(f"[NATIVE-WEBRTC] Disconnect detected via {source}")
+        if self.on_disconnected is not None:
+            await self._call(self.on_disconnected)
+
     async def _on_channel_close(self):
-        print("[NATIVE-WEBRTC] Control channel closed")
+        print("[NATIVE-WEBRTC] Control channel closed; revoking session authorization")
+        await self._notify_disconnected("DataChannel")
 
     async def _on_native_event(self, event: dict):
         event_type = event.get("type")
@@ -123,15 +164,7 @@ class PeerConnection:
         if event_type in {"peer_connection", "connection_state"} and state in {
             "failed", "closed"
         }:
-            self.security_authorized = False
-            self._stop_cursor_sync()
-            if self._transport is not None:
-                try:
-                    self._transport.native.set_video_enabled(False)
-                except Exception as exc:
-                    print("[NATIVE-WEBRTC] Failed to close video gate:", exc)
-            if self.on_disconnected is not None:
-                await self._call(self.on_disconnected)
+            await self._notify_disconnected(f"{event_type}={state}")
 
     async def _on_local_candidate(self, candidate: dict):
         # ICE gathering can begin before the offer/answer has been sent. Buffer
@@ -219,6 +252,11 @@ class PeerConnection:
                 await self.receive_answer(sdp)
         elif message_type == "candidate":
             await self.add_candidate(message)
+
+    def send_auth_text(self, text: str):
+        if not self._started or self._transport is None:
+            return False
+        return self._transport.native.send_auth(text.encode("utf-8"), binary=False)
 
     def send_text(self, text: str):
         if not self._started or self._transport is None:

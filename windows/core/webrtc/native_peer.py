@@ -103,6 +103,15 @@ class NativePeer:
         dll.lazypc_webrtc_has_control_channel.argtypes = []
         dll.lazypc_webrtc_has_control_channel.restype = ctypes.c_int
 
+        dll.lazypc_webrtc_has_auth_channel.argtypes = []
+        dll.lazypc_webrtc_has_auth_channel.restype = ctypes.c_int
+        dll.lazypc_webrtc_auth_state.argtypes = []
+        dll.lazypc_webrtc_auth_state.restype = ctypes.c_int
+        dll.lazypc_webrtc_send_auth.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
+        ]
+        dll.lazypc_webrtc_send_auth.restype = ctypes.c_int
+
         dll.lazypc_webrtc_send_control.argtypes = [
             ctypes.c_void_p,
             ctypes.c_size_t,
@@ -286,6 +295,24 @@ class NativePeer:
             .lazypc_webrtc_has_control_channel()
             == 1
         )
+
+    def has_auth_channel(self) -> bool:
+        self._require_peer()
+        return self._dll.lazypc_webrtc_has_auth_channel() == 1
+
+    def auth_state(self) -> int:
+        self._require_peer()
+        return int(self._dll.lazypc_webrtc_auth_state())
+
+    def send_auth(self, data: bytes, binary: bool = False) -> bool:
+        self._require_peer()
+        if not data:
+            return False
+        buffer = ctypes.create_string_buffer(data)
+        result = self._dll.lazypc_webrtc_send_auth(
+            ctypes.cast(buffer, ctypes.c_void_p), len(data), 1 if binary else 0
+        )
+        return result == 1
 
     def control_state(self) -> int:
         """

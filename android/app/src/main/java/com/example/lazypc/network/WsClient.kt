@@ -69,6 +69,7 @@ class WsClient(
         socketOpen = false
         signalingReady = false
 
+        Log.i("LazyPC-Security", "Connecting WebSocket to $url")
         val request = Request.Builder()
             .url(url)
             .build()
@@ -478,6 +479,10 @@ class WsClient(
                     socket = ws
                     socketOpen = true
                 }
+                Log.i(
+                    "LazyPC-Security",
+                    "WebSocket transport opened: HTTP ${response.code} ${response.message}"
+                )
 
                 // IMPORTANT:
                 // HELLO_CLIENT must be the first application-level message.
@@ -645,7 +650,9 @@ class WsClient(
             ) {
                 Log.e(
                     "LazyPC-Security",
-                    "🔴 SIGNALING FAILURE [CLIENT]: ${t.message}",
+                    "🔴 SIGNALING FAILURE [CLIENT]: ${t.message}; " +
+                            "http=${response?.code ?: "no-response"}; " +
+                            "url=$url",
                     t
                 )
 

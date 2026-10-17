@@ -26,6 +26,12 @@ namespace LazyPC.UI
 
         private readonly object _pairingResponseLock = new();
         private TaskCompletionSource<JsonDocument>? _pairingResponseSource;
+        private ContentDialog? _activePairingQrDialog;
+        private string? _pendingPairingCodePrompt;
+
+        private readonly object _pairingCodeResultLock = new();
+        private TaskCompletionSource<string>? _pairingCodeResultSource;
+        private string? _activePairingCodeResultId;
 
         // Connection approval and QR pairing are completely independent UI flows.
         // Connection requests use their own Window; QR uses a ContentDialog.
@@ -341,6 +347,63 @@ namespace LazyPC.UI
                             message
                         );
 
+                        continue;
+                    }
+
+                    if (type == "pairing_code_prompt")
+                    {
+                        string rawPrompt = message.RootElement.GetRawText();
+                        bool queued = DispatcherQueue.TryEnqueue(() =>
+                        {
+                            _pendingPairingCodePrompt = rawPrompt;
+                            Log("[PAIRING] Phone code prompt received; closing QR dialog to enter code");
+                            _activePairingQrDialog?.Hide();
+                        });
+
+                        if (!queued)
+                            Log("[PAIRING] ERROR: Could not dispatch pairing_code_prompt to UI");
+
+                        continue;
+                    }
+
+                    if (type == "pairing_code_result")
+                    {
+                        string rawResult = message.RootElement.GetRawText();
+                        string resultPairingId =
+                            message.RootElement.TryGetProperty("pairing_id", out var resultIdProperty)
+                                ? resultIdProperty.GetString() ?? string.Empty
+                                : string.Empty;
+
+                        TaskCompletionSource<string>? source = null;
+                        lock (_pairingCodeResultLock)
+                        {
+                            if (_pairingCodeResultSource is not null &&
+                                string.Equals(_activePairingCodeResultId, resultPairingId, StringComparison.Ordinal))
+                            {
+                                source = _pairingCodeResultSource;
+                                _pairingCodeResultSource = null;
+                                _activePairingCodeResultId = null;
+                            }
+                        }
+
+                        source?.TrySetResult(rawResult);
+                        continue;
+                    }
+
+                    if (type == "pairing_finished")
+                    {
+                        bool success =
+                            message.RootElement.TryGetProperty("success", out var pairedProperty) &&
+                            pairedProperty.ValueKind == JsonValueKind.True;
+                        string reason =
+                            message.RootElement.TryGetProperty("reason", out var reasonProperty)
+                                ? reasonProperty.GetString() ?? "unknown"
+                                : "unknown";
+                        Log($"[PAIRING] Agent pairing finished: success={success}, reason={reason}");
+                        _ = _ipcClient.SendAsync(
+                            new { type = "get_trusted_devices" },
+                            _ipcCancellation.Token
+                        );
                         continue;
                     }
 
@@ -1089,10 +1152,25 @@ namespace LazyPC.UI
             lock (_pairingResponseLock)
             {
                 _pairingResponseSource?.TrySetCanceled();
-
-                _pairingResponseSource =
-                    null;
+                _pairingResponseSource = null;
             }
+
+            lock (_pairingCodeResultLock)
+            {
+                _pairingCodeResultSource?.TrySetCanceled();
+                _pairingCodeResultSource = null;
+                _activePairingCodeResultId = null;
+            }
+
+            try
+            {
+                _activePairingQrDialog?.Hide();
+            }
+            catch
+            {
+                // Dialog may already be closed.
+            }
+            _activePairingQrDialog = null;
 
             lock (_connectionRequestLock)
             {
@@ -1183,6 +1261,7 @@ namespace LazyPC.UI
             try
             {
                 Log("[PAIRING] User clicked Pair new device");
+                _pendingPairingCodePrompt = null;
 
                 var responseSource =
                     new TaskCompletionSource<JsonDocument>(
@@ -1279,6 +1358,106 @@ namespace LazyPC.UI
                 Log($"[PAIRING] Showing QR dialog: {qrPath}");
                 await ShowPairingQrAsync(qrPath);
                 Log("[PAIRING] QR dialog finished");
+
+                string? rawPrompt = _pendingPairingCodePrompt;
+                _pendingPairingCodePrompt = null;
+
+                if (string.IsNullOrWhiteSpace(rawPrompt))
+                {
+                    // The user closed the QR before the phone completed Noise msg1.
+                    await _ipcClient.SendAsync(
+                        new { type = "pairing_cancel" },
+                        _ipcCancellation.Token
+                    );
+                    return;
+                }
+
+                string pairingId;
+                int digits;
+                using (JsonDocument promptDocument = JsonDocument.Parse(rawPrompt))
+                {
+                    JsonElement promptRoot = promptDocument.RootElement;
+                    pairingId = promptRoot.TryGetProperty("pairing_id", out var idProperty)
+                        ? idProperty.GetString() ?? string.Empty
+                        : string.Empty;
+                    digits = promptRoot.TryGetProperty("digits", out var digitsProperty) &&
+                             digitsProperty.TryGetInt32(out int parsedDigits)
+                        ? parsedDigits
+                        : 0;
+                }
+
+                if (pairingId.Length == 0 || digits != 6)
+                {
+                    Log("[PAIRING] Invalid pairing_code_prompt received");
+                    await _ipcClient.SendAsync(
+                        new { type = "pairing_code_response", pairing_id = pairingId, code = string.Empty },
+                        _ipcCancellation.Token
+                    );
+                    await ShowErrorAsync("Не удалось открыть ввод кода сопряжения. Создайте новую пару.");
+                    return;
+                }
+
+                string? enteredCode = await ShowPairingCodeEntryAsync(digits);
+
+                var resultSource = new TaskCompletionSource<string>(
+                    TaskCreationOptions.RunContinuationsAsynchronously
+                );
+
+                lock (_pairingCodeResultLock)
+                {
+                    _pairingCodeResultSource = resultSource;
+                    _activePairingCodeResultId = pairingId;
+                }
+
+                try
+                {
+                    await _ipcClient.SendAsync(
+                        new
+                        {
+                            type = "pairing_code_response",
+                            pairing_id = pairingId,
+                            code = enteredCode ?? string.Empty
+                        },
+                        _ipcCancellation.Token
+                    );
+
+                    string rawResult = await resultSource.Task.WaitAsync(
+                        TimeSpan.FromSeconds(8),
+                        _ipcCancellation.Token
+                    );
+
+                    bool accepted = false;
+                    using (JsonDocument resultDocument = JsonDocument.Parse(rawResult))
+                    {
+                        JsonElement resultRoot = resultDocument.RootElement;
+                        string resultId = resultRoot.TryGetProperty("pairing_id", out var resultIdProperty)
+                            ? resultIdProperty.GetString() ?? string.Empty
+                            : string.Empty;
+                        accepted =
+                            string.Equals(resultId, pairingId, StringComparison.Ordinal) &&
+                            resultRoot.TryGetProperty("accepted", out var acceptedProperty) &&
+                            acceptedProperty.ValueKind == JsonValueKind.True;
+                    }
+
+                    if (!accepted)
+                    {
+                        Log("[PAIRING] Entered phone code rejected");
+                        await ShowErrorAsync("Код не совпадает. Попытка сопряжения завершена. Отсканируйте новый QR-код и попробуйте снова.");
+                        return;
+                    }
+
+                    Log("[PAIRING] Phone code verified by Agent");
+                }
+                finally
+                {
+                    lock (_pairingCodeResultLock)
+                    {
+                        if (ReferenceEquals(_pairingCodeResultSource, resultSource))
+                            _pairingCodeResultSource = null;
+                        if (string.Equals(_activePairingCodeResultId, pairingId, StringComparison.Ordinal))
+                            _activePairingCodeResultId = null;
+                    }
+                }
             }
             catch (TimeoutException)
             {
@@ -1418,6 +1597,7 @@ namespace LazyPC.UI
             }
 
             dialog.XamlRoot = root;
+            _activePairingQrDialog = dialog;
 
             try
             {
@@ -1435,6 +1615,12 @@ namespace LazyPC.UI
 
                 Log("[UI] SHOW QR dialog");
 
+                if (!string.IsNullOrWhiteSpace(_pendingPairingCodePrompt))
+                {
+                    Log("[UI] Pairing code prompt arrived before QR dialog display; skipping QR modal");
+                    return;
+                }
+
                 await dialog.ShowAsync();
 
                 Log("[UI] HIDE QR dialog");
@@ -1444,9 +1630,125 @@ namespace LazyPC.UI
                 Log($"[UI] QR dialog failed: {ex}");
                 throw;
             }
+            finally
+            {
+                if (ReferenceEquals(_activePairingQrDialog, dialog))
+                {
+                    _activePairingQrDialog = null;
+                }
+            }
         }
 
         // =========================================================
+        private async Task<string?> ShowPairingCodeEntryAsync(int digits)
+        {
+            var instruction = new TextBlock
+            {
+                Text = "На телефоне отображается код из шести цифр. Введите его здесь.",
+                FontSize = 14,
+                Foreground = new SolidColorBrush(LazyPcText),
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                TextAlignment = Microsoft.UI.Xaml.TextAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Stretch
+            };
+
+            var codeBox = new TextBox
+            {
+                Width = 250,
+                MaxLength = digits,
+                PlaceholderText = "Шестизначный код",
+                HorizontalAlignment = HorizontalAlignment.Center,
+                TextAlignment = Microsoft.UI.Xaml.TextAlignment.Center,
+                FontSize = 24
+            };
+
+            var validationText = new TextBlock
+            {
+                Text = string.Empty,
+                FontSize = 12,
+                Foreground = new SolidColorBrush(ColorHelper.FromArgb(0xFF, 0xC4, 0x2B, 0x35)),
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                TextAlignment = Microsoft.UI.Xaml.TextAlignment.Center
+            };
+
+            var content = new StackPanel
+            {
+                Width = 390,
+                Spacing = 14,
+                Padding = new Thickness(10, 4, 10, 4),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            content.Children.Add(new TextBlock
+            {
+                Text = "Сопряжение Trusted Device",
+                FontSize = 22,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(LazyPcText),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                TextAlignment = Microsoft.UI.Xaml.TextAlignment.Center
+            });
+            content.Children.Add(instruction);
+            content.Children.Add(codeBox);
+            content.Children.Add(validationText);
+
+            var dialog = new ContentDialog
+            {
+                Title = "LazyPC — код с телефона",
+                Content = content,
+                PrimaryButtonText = "Проверить код",
+                CloseButtonText = "Отмена",
+                DefaultButton = ContentDialogButton.Primary
+            };
+
+            string? enteredCode = null;
+            dialog.PrimaryButtonClick += (_, args) =>
+            {
+                string candidate = codeBox.Text.Trim();
+                bool valid = candidate.Length == digits;
+                foreach (char ch in candidate)
+                {
+                    if (ch < '0' || ch > '9')
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+
+                if (!valid)
+                {
+                    validationText.Text = "Введите ровно шесть цифр (0–9).";
+                    args.Cancel = true;
+                    return;
+                }
+
+                enteredCode = candidate;
+            };
+
+            var root = Content?.XamlRoot;
+            if (root is null)
+            {
+                Log("[PAIRING] Cannot show code entry: XamlRoot is null");
+                return null;
+            }
+
+            dialog.XamlRoot = root;
+            try
+            {
+                Activate();
+                IntPtr hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+                if (hwnd != IntPtr.Zero)
+                    SetForegroundWindow(hwnd);
+
+                ContentDialogResult result = await dialog.ShowAsync();
+                return result == ContentDialogResult.Primary ? enteredCode : null;
+            }
+            catch (Exception ex)
+            {
+                Log($"[PAIRING] Code-entry dialog failed: {ex}");
+                return null;
+            }
+        }
+
         // ORDINARY V2 AUTH SECRET
         // =========================================================
 
@@ -1762,7 +2064,7 @@ namespace LazyPC.UI
                     Glyph = "\uE8EA",
                     FontSize = 22,
                     Foreground =
-                        (Brush)((FrameworkElement)Content). Resources["PurpleDark"],
+                        (Brush)((FrameworkElement)Content).Resources["PurpleDark"],
                     HorizontalAlignment =
                         HorizontalAlignment.Center,
                     VerticalAlignment =
@@ -1820,7 +2122,7 @@ namespace LazyPC.UI
                     Text = "Доверенное",
                     FontSize = 12,
                     Foreground =
-                        (Brush)((FrameworkElement)Content).     Resources["PurpleDark"]
+                        (Brush)((FrameworkElement)Content).Resources["PurpleDark"]
                 };
 
                 Grid.SetColumn(trustedBadge, 2);
@@ -1848,7 +2150,7 @@ namespace LazyPC.UI
                     Text = "Нет доверенных устройств",
                     FontSize = 14,
                     Foreground =
-                        (Brush)((FrameworkElement)Content). Resources["TextSecondary"],
+                        (Brush)((FrameworkElement)Content).Resources["TextSecondary"],
                     HorizontalAlignment =
                         HorizontalAlignment.Center
                 };

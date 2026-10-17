@@ -1,202 +1,68 @@
 package com.example.lazypc.security
 
 import android.content.Context
-import org.json.JSONArray
-import org.json.JSONObject
+import android.util.Base64
 
+/** A PC trusted through Secure Link v4. Identity is the pinned X25519 public key, not a numeric code. */
 data class TrustedPc(
-    val pcCode: String,
-    val name: String,
-    val pcIdentityPublic: String? = null
+    val pcIdentityPublic: String,
+    val hardwareAlias: String,
+    val name: String
 )
 
 class TrustedPcStore(private val context: Context) {
-
-    private val prefs =
-        context.getSharedPreferences(
-            "trusted_pcs",
-            Context.MODE_PRIVATE
-        )
+    private val prefs = context.getSharedPreferences("secure_link_v4_trusted", Context.MODE_PRIVATE)
 
     fun list(): List<TrustedPc> {
-        val raw =
-            prefs.getString(
-                "devices",
-                null
-            ) ?: return emptyList()
-
-        return try {
-            val array = JSONArray(raw)
-
-            buildList {
-                for (i in 0 until array.length()) {
-                    val item =
-                        array.optJSONObject(i)
-                            ?: continue
-
-                    val code =
-                        item
-                            .optString("pc_code")
-                            .filter { it.isDigit() }
-
-                    if (code.length == 9) {
-                        add(
-                            TrustedPc(
-                                pcCode = code,
-                                name = item
-                                    .optString("name")
-                                    .ifBlank {
-                                        "Компьютер"
-                                    },
-                                pcIdentityPublic =
-                                    item
-                                        .optString(
-                                            "pc_identity_public"
-                                        )
-                                        .takeIf {
-                                            it.isNotBlank()
-                                        }
-                            )
-                        )
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-            emptyList()
-        }
-    }
-
-    fun addOrUpdate(
-        pcCode: String,
-        name: String? = null,
-        pcIdentityPublic: String? = null
-    ) {
-        val code =
-            pcCode
-                .filter { it.isDigit() }
-
-        if (code.length != 9) {
-            return
-        }
-
-        val items =
-            list().toMutableList()
-
-        val index =
-            items.indexOfFirst {
-                it.pcCode == code
-            }
-
-        if (index >= 0) {
-            val old = items[index]
-
-            items[index] =
-                old.copy(
-                    name =
-                        name?.takeIf {
-                            it.isNotBlank()
-                        } ?: old.name,
-
-                    pcIdentityPublic =
-                        pcIdentityPublic
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
-                            ?: old.pcIdentityPublic
-                )
-        } else {
-            items +=
+        val all = prefs.all
+        return all.keys
+            .filter { it.startsWith(PC_STATIC_PREFIX) }
+            .mapNotNull { staticEntry ->
+                val identity = all[staticEntry] as? String ?: return@mapNotNull null
+                if (identity.isBlank()) return@mapNotNull null
+                val key = staticEntry.removePrefix(PC_STATIC_PREFIX)
+                val alias = all[HW_ALIAS_PREFIX + key] as? String ?: return@mapNotNull null
+                if (alias.isBlank()) return@mapNotNull null
                 TrustedPc(
-                    pcCode = code,
-                    name =
-                        name?.takeIf {
-                            it.isNotBlank()
-                        }
-                            ?: "Компьютер ${items.size + 1}",
-
-                    pcIdentityPublic =
-                        pcIdentityPublic
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
+                    pcIdentityPublic = identity,
+                    hardwareAlias = alias,
+                    name = "Компьютер · ${identity.take(7)}"
                 )
-        }
-
-        save(items)
+            }
+            .sortedBy { it.name }
     }
 
-    fun remove(pcCode: String) {
-        val code =
-            pcCode
-                .filter { it.isDigit() }
+    /** Called only after an authenticated Secure Link v4 pair4/PAIRED response. */
+    fun addOrUpdate(pcIdentityPublic: String, hardwareAlias: String): Boolean {
+        if (pcIdentityPublic.isBlank() || hardwareAlias.isBlank()) return false
+        val key = pcIdentityPublic
+        return prefs.edit()
+            .putString(PC_STATIC_PREFIX + key, pcIdentityPublic)
+            .putString(HW_ALIAS_PREFIX + key, hardwareAlias)
+            .commit()
+    }
 
-        val current = list()
+    fun remove(pcIdentityPublic: String) {
+        val key = pcIdentityPublic
+        val alias = prefs.getString(HW_ALIAS_PREFIX + key, null)
+        prefs.edit()
+            .remove(PC_STATIC_PREFIX + key)
+            .remove(HW_ALIAS_PREFIX + key)
+            .commit()
 
-        val pc =
-            current.firstOrNull {
-                it.pcCode == code
-            }
-
-        // Remove only the credentials belonging to this Trusted PC.
-        // The global Android Identity Key and the global StrongBox key
-        // remain untouched.
-        pc?.pcIdentityPublic?.let { pcIdentityPublic ->
+        // Delete only this PC's session-authorization key; leave the phone's
+        // persistent identity key and all other trusted PCs untouched.
+        if (!alias.isNullOrBlank()) {
             try {
-                SecurityKeyStore().deleteCredentialsForPc(
-                    context = context,
-                    pcIdentityPublic = pcIdentityPublic
-                )
+                SecureLinkStrongBox(context).deletePairingKey(alias)
             } catch (_: Throwable) {
-                // Keep local Trusted PC removal working even if the
-                // keystore entry was already absent.
+                // Local trust removal should still work if the alias is already absent.
             }
         }
-
-        save(
-            current.filterNot {
-                it.pcCode == code
-            }
-        )
     }
 
-    private fun save(
-        items: List<TrustedPc>
-    ) {
-        val array = JSONArray()
-
-        items.forEach { pc ->
-            array.put(
-                JSONObject().apply {
-                    put(
-                        "pc_code",
-                        pc.pcCode
-                    )
-
-                    put(
-                        "name",
-                        pc.name
-                    )
-
-                    pc.pcIdentityPublic
-                        ?.takeIf {
-                            it.isNotBlank()
-                        }
-                        ?.let {
-                            put(
-                                "pc_identity_public",
-                                it
-                            )
-                        }
-                }
-            )
-        }
-
-        prefs
-            .edit()
-            .putString(
-                "devices",
-                array.toString()
-            )
-            .apply()
+    companion object {
+        private const val PC_STATIC_PREFIX = "pc_static_"
+        private const val HW_ALIAS_PREFIX = "hw_alias_"
     }
 }

@@ -8,6 +8,85 @@ from app.registry import registry
 from app.relay import safe_close, safe_send_text
 
 
+# Secure Link v4 opaque-room relay. Room IDs are public routing labels, not
+# authentication. Noise authenticates the payload; the server only forwards
+# exact envelopes between sockets that explicitly subscribed to the same room.
+_secure_link_rooms: dict[str, set[WebSocket]] = {}
+_SECURE_LINK_KINDS = frozenset({"hello", "reply", "pair1", "pair2", "pair3", "pair4", "code_ok"})
+_SECURE_LINK_MAX_BYTES = 64 * 1024
+
+
+def _decode_secure_room(value: object) -> str | None:
+    import base64
+    if not isinstance(value, str) or len(value) > 128:
+        return None
+    try:
+        raw = value.encode("ascii")
+        raw += b"=" * ((4 - len(raw) % 4) % 4)
+        room = base64.b64decode(raw, altchars=b"-_", validate=True)
+    except (ValueError, UnicodeError):
+        return None
+    if len(room) != 16:
+        return None
+    # Require canonical unpadded base64url, preventing multiple aliases.
+    canonical = base64.urlsafe_b64encode(room).rstrip(b"=").decode("ascii")
+    return canonical if canonical == value else None
+
+
+def _valid_secure_link_envelope(message: dict) -> bool:
+    import base64
+    room = _decode_secure_room(message.get("room"))
+    kind = message.get("kind")
+    data = message.get("data")
+    if room is None or kind not in _SECURE_LINK_KINDS:
+        return False
+    if not isinstance(data, str) or len(data) > ((_SECURE_LINK_MAX_BYTES + 2) // 3) * 4:
+        return False
+    try:
+        raw = base64.b64decode(data.encode("ascii"), validate=True)
+    except (ValueError, UnicodeError):
+        return False
+    return 0 < len(raw) <= _SECURE_LINK_MAX_BYTES
+
+
+async def _handle_secure_link_subscribe(ws: WebSocket, message: dict) -> None:
+    room = _decode_secure_room(message.get("room"))
+    if room is None:
+        await safe_send_text(ws, json.dumps({
+            "type": "secure_link_subscribe_result",
+            "ok": False,
+            "reason": "invalid_room",
+        }))
+        return
+    _secure_link_rooms.setdefault(room, set()).add(ws)
+    await safe_send_text(ws, json.dumps({
+        "type": "secure_link_subscribe_result",
+        "ok": True,
+        "room": room,
+    }))
+
+
+async def _handle_secure_link_message(ws: WebSocket, message: dict) -> bool:
+    if not _valid_secure_link_envelope(message):
+        return True  # malformed secure-link traffic is dropped silently
+    room = _decode_secure_room(message.get("room"))
+    if room is None:
+        return True
+    targets = tuple(_secure_link_rooms.get(room, ()))
+    payload = json.dumps(message, separators=(",", ":"))
+    for target in targets:
+        if target is not ws:
+            await safe_send_text(target, payload)
+    return True
+
+
+def _remove_secure_link_socket(ws: WebSocket) -> None:
+    for room, subscribers in list(_secure_link_rooms.items()):
+        subscribers.discard(ws)
+        if not subscribers:
+            _secure_link_rooms.pop(room, None)
+
+
 # Short-lived pairing-token routing table.
 # The signaling server only routes the token; Windows validates it.
 _pairing_targets: dict[str, tuple[str, float]] = {}
@@ -560,6 +639,16 @@ async def handle_connection(ws: WebSocket):
 
             message = _parse_json(msg)
 
+            # Secure Link v4 room subscription and opaque relay. These control
+            # messages are handled before the legacy PC-ID relay.
+            if message and message.get("type") == "secure_link_subscribe":
+                await _handle_secure_link_subscribe(ws, message)
+                continue
+
+            if message and message.get("type") == "secure_link":
+                await _handle_secure_link_message(ws, message)
+                continue
+
             # ---------------------------------------------------------
             # Client-side signaling commands consumed by the server.
             # ---------------------------------------------------------
@@ -738,6 +827,7 @@ async def handle_connection(ws: WebSocket):
         )
 
     finally:
+        _remove_secure_link_socket(ws)
         if role == PeerRole.AGENT and pc_id:
             _remove_pairing_targets_for_pc(pc_id)
 
