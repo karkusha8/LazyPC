@@ -134,6 +134,7 @@ class MainActivity : AppCompatActivity() {
 
     private var sessionConnecting by mutableStateOf(false)
     private var sessionConnected by mutableStateOf(false)
+    private var trustedConnectionError by mutableStateOf<String?>(null)
 
     private var simpleConnectionConnecting by mutableStateOf(false)
     private var simpleConnectionConnected by mutableStateOf(false)
@@ -566,8 +567,18 @@ class MainActivity : AppCompatActivity() {
                 HomeScreen(
                     trustedPcs = trustedPcs,
                     pcOnline = pcOnline,
+                    connecting = sessionConnecting,
+                    connectionError = trustedConnectionError,
+                    onCancelConnection = {
+                        webRtcService?.disconnectSession()
+                        sessionConnecting = false
+                        sessionConnected = false
+                        connectionState = ConnectionState.Disconnected
+                        trustedConnectionError = "Подключение отменено"
+                    },
 
                     onComputerClick = { pc ->
+                        trustedConnectionError = null
                         connectionState = ConnectionState.Connecting
                         webRtcService?.connectTrusted(pc.pcIdentityPublic, pc.hardwareAlias)
                     },
@@ -651,6 +662,7 @@ class MainActivity : AppCompatActivity() {
 
                 sessionConnecting = connecting
                 sessionConnected = connected
+                if (connecting || connected) trustedConnectionError = null
 
                 // If an active Trusted Device session ends from the service
                 // side, return to Home instead of exposing the old
@@ -669,6 +681,14 @@ class MainActivity : AppCompatActivity() {
                         connecting -> ConnectionState.Connecting
                         else -> ConnectionState.Disconnected
                     }
+            },
+            onSessionError = { message ->
+                runOnUiThread {
+                    trustedConnectionError = message
+                    sessionConnecting = false
+                    sessionConnected = false
+                    connectionState = ConnectionState.Error(message)
+                }
             }
         )
 

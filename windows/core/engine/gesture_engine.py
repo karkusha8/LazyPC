@@ -122,6 +122,16 @@ class GestureEngine:
 
         if self.dragging:
 
-            self.backend.mouse_up("left")
+            try:
+                self.backend.mouse_up("left")
+            finally:
+                self.dragging = False
 
-            self.dragging = False
+
+    def cancel_drag(self):
+        """Force-release the left mouse button if a drag/session is interrupted."""
+        self.dragging = False
+
+        # Always send mouse_up: after a broken input sequence, the OS button
+        # state is what matters, even if the local flag is already false.
+        self.backend.mouse_up("left")

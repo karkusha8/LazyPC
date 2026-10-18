@@ -1436,6 +1436,11 @@ class Agent:
             "(WebRTC is kept alive)"
         )
 
+        # Signaling may drop while a drag is active, even if WebRTC remains up.
+        try:
+            self.gesture_engine.cancel_drag()
+        except Exception as error:
+            print("[INPUT] Mouse drag release after signaling disconnect failed:", repr(error))
         self.keyboard_state.release_all()
 
     # ================================================================
@@ -1623,6 +1628,12 @@ class Agent:
     async def _cleanup_session(self, reason: str):
         print(f"[AGENT] Cleaning up session: {reason}")
         try:
+            # DragEnd can be lost when the client disconnects mid-gesture.
+            # Release the OS mouse button before stopping WebRTC.
+            try:
+                self.gesture_engine.cancel_drag()
+            except Exception as error:
+                print("[INPUT] Mouse drag release during session cleanup failed:", repr(error))
             self.keyboard_state.release_all()
             self.peer.revoke_hardware_session()
             self._clear_connection_state()

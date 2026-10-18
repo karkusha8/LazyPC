@@ -30,6 +30,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -56,12 +57,14 @@ fun HomeScreen(
     onAddComputer: () -> Unit,
     onConnectById: () -> Unit,
     pcOnline: Map<String, Boolean> = emptyMap(),
+    connecting: Boolean = false,
+    connectionError: String? = null,
+    onCancelConnection: () -> Unit = {},
     onSettingsClick: () -> Unit = {},
     onDeleteComputer: (TrustedPc) -> Unit = {}
 ) {
     var selectedPc by remember { mutableStateOf<TrustedPc?>(null) }
     var deletePc by remember { mutableStateOf<TrustedPc?>(null) }
-    var connectingPc by remember { mutableStateOf<TrustedPc?>(null) }
 
     Column(
         modifier = Modifier
@@ -126,18 +129,17 @@ fun HomeScreen(
         ComputerActionSheet(
             pc = pc,
             online = pcOnline[pc.pcIdentityPublic] == true,
-            connecting = connectingPc?.pcIdentityPublic == pc.pcIdentityPublic,
+            connecting = connecting,
+            connectionError = connectionError,
             onDismiss = {
-                if (connectingPc == null) {
+                if (!connecting) {
                     selectedPc = null
                 }
             },
-            onConnect = {
-                connectingPc = pc
-                onComputerClick(pc)
-            },
+            onConnect = { onComputerClick(pc) },
+            onCancelConnection = onCancelConnection,
             onDelete = {
-                if (connectingPc == null) {
+                if (!connecting) {
                     selectedPc = null
                     deletePc = pc
                 }
@@ -245,14 +247,25 @@ private fun ComputerActionSheet(
     pc: TrustedPc,
     online: Boolean,
     connecting: Boolean,
+    connectionError: String?,
     onDismiss: () -> Unit,
     onConnect: () -> Unit,
+    onCancelConnection: () -> Unit,
     onDelete: () -> Unit
 ) {
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val sheetState = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true,
+        confirmValueChange = { newValue ->
+            !connecting || newValue != androidx.compose.material3.SheetValue.Hidden
+        }
+    )
 
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            if (!connecting) {
+                onDismiss()
+            }
+        },
         sheetState = sheetState
     ) {
         Column(
@@ -303,6 +316,17 @@ private fun ComputerActionSheet(
             )
 
             Spacer(modifier = Modifier.height(22.dp))
+
+            if (!connecting && connectionError != null) {
+                Text(
+                    text = connectionError,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+            }
 
             Button(
                 onClick = onConnect,
@@ -365,6 +389,13 @@ private fun ComputerActionSheet(
                     textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = onCancelConnection,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Text("Отменить подключение")
+                }
             }
         }
     }

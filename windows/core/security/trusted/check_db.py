@@ -17,9 +17,3 @@ else:
                 value = bytes(value).hex()[:16] + "..."   # public keys, abbreviated
             print(f"{key}: {value}")
         print("-" * 60)
-
-legacy = db.legacy_count()
-if legacy:
-    print(f"\n{legacy} legacy (pre-v4) trusted_devices row(s) remain. They cannot be "
-          "used by the v4 protocol: re-pair those phones, then call "
-          "LazyPCDatabase().drop_legacy().")

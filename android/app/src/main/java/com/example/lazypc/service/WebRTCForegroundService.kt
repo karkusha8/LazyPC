@@ -65,6 +65,7 @@ class WebRTCForegroundService : Service() {
     private var onCursorPosition: ((Float, Float) -> Unit)? = null
     private var onSignalingState: ((Boolean) -> Unit)? = null
     private var onSessionState: ((Boolean, Boolean) -> Unit)? = null
+    private var onSessionError: ((String) -> Unit)? = null
     private var onTrustedPcPaired: ((String, String?) -> Unit)? = null
     private var onSecureLinkPaired: ((String, String) -> Unit)? = null
     private var onDirectSessionState: ((Boolean, Boolean, String?) -> Unit)? = null
@@ -388,7 +389,10 @@ class WebRTCForegroundService : Service() {
             (Boolean) -> Unit,
 
         onSessionState:
-            (Boolean, Boolean) -> Unit
+            (Boolean, Boolean) -> Unit,
+
+        onSessionError:
+        ((String) -> Unit)? = null
     ) {
         this.onVideoTrackChanged =
             onVideoTrackChanged
@@ -401,6 +405,9 @@ class WebRTCForegroundService : Service() {
 
         this.onSessionState =
             onSessionState
+
+        this.onSessionError =
+            onSessionError
 
         onVideoTrackChanged(
             currentVideoTrack
@@ -491,6 +498,7 @@ class WebRTCForegroundService : Service() {
         onCursorPosition = null
         onSignalingState = null
         onSessionState = null
+        onSessionError = null
         onTrustedPcPaired = null
         onSecureLinkPaired = null
         onDirectSessionState = null
@@ -509,10 +517,12 @@ class WebRTCForegroundService : Service() {
     fun connectTrusted(pcIdentityPublic: String, hardwareAlias: String) {
         if (sessionConnecting || sessionConnected || directAttemptActive) {
             Log.w(TAG, "Secure Link v4 connect ignored: another session is active")
+            onSessionError?.invoke("Уже выполняется другое подключение")
             return
         }
         if (pcIdentityPublic.isBlank() || hardwareAlias.isBlank()) {
             Log.e(TAG, "Secure Link v4 connect rejected: missing trusted identity or StrongBox alias")
+            onSessionError?.invoke("Не хватает данных доверенного устройства")
             return
         }
         try {
@@ -525,6 +535,7 @@ class WebRTCForegroundService : Service() {
             beginSecureLinkSession(pcStatic, hardwareAlias)
         } catch (error: Throwable) {
             Log.e(TAG, "Could not start Secure Link v4 session", error)
+            onSessionError?.invoke("Не удалось начать подключение: ${error.message ?: "ошибка данных"}")
         }
     }
 
@@ -983,12 +994,14 @@ class WebRTCForegroundService : Service() {
         val pcStatic = secureSessionPcStatic ?: return
         val signaling = secureLinkV4Signaling ?: return
         secureSessionHelloPending = false
+        val generation = sessionGeneration
         serviceScope.launch(Dispatchers.IO) {
             var identity: SecureLinkNoiseKeyStore.StaticIdentity? = null
             var noise: SecureLinkNoiseSession? = null
             try {
                 identity = SecureLinkNoiseKeyStore(this@WebRTCForegroundService).loadOrCreate()
                 val offer = webrtc.createSecureOffer()
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 val fpPhone = SecureLinkV4.sdpFingerprint(offer)
                 noise = SecureLinkNoiseSession.sessionInitiator(identity.privateKey, pcStatic)
                 val hello = JSONObject().apply {
@@ -996,7 +1009,9 @@ class WebRTCForegroundService : Service() {
                     put("sdp", offer)
                 }.toString().toByteArray(StandardCharsets.UTF_8)
                 val message = noise.writeMessage(hello)
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 check(signaling.send(room, "hello", message)) { "Could not send secure hello" }
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 secureSessionPhoneStatic = identity.publicKey.copyOf()
                 secureSessionFpPhone = fpPhone
                 secureSessionNoise = noise
@@ -1004,7 +1019,9 @@ class WebRTCForegroundService : Service() {
                 Log.i(TAG, "Secure Link v4 Noise IK hello sent; SDP/ICE remained inside Noise")
             } catch (error: Throwable) {
                 Log.e(TAG, "Secure Link v4 hello failed", error)
-                failSecureLinkSession("Noise hello failed")
+                if (generation == sessionGeneration && sessionConnecting) {
+                    failSecureLinkSession("Noise hello failed")
+                }
             } finally {
                 identity?.privateKey?.fill(0)
                 noise?.close()
@@ -1017,30 +1034,39 @@ class WebRTCForegroundService : Service() {
             Log.w(TAG, "Unexpected Secure Link session message kind=$kind")
             return
         }
+        val generation = sessionGeneration
         serviceScope.launch(Dispatchers.IO) {
             try {
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 val noise = secureSessionNoise ?: error("No active Noise session")
                 val plain = noise.readMessage(data)
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 check(noise.isHandshakeFinished) { "Noise IK handshake did not finish" }
                 val answer = JSONObject(String(plain, StandardCharsets.UTF_8)).getString("sdp")
                 val fpPc = SecureLinkV4.sdpFingerprint(answer)
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 secureSessionHandshakeHash = noise.handshakeHash()
                 secureSessionFpPc = fpPc
                 webrtc.applySecureAnswer(answer)
                 Log.i(TAG, "Secure Link v4 Noise IK completed; authenticated SDP answer applied")
             } catch (error: Throwable) {
                 Log.e(TAG, "Secure Link v4 reply rejected", error)
-                failSecureLinkSession("Noise reply or SDP answer invalid")
+                if (generation == sessionGeneration && sessionConnecting) {
+                    failSecureLinkSession("Noise reply or SDP answer invalid")
+                }
             }
         }
     }
 
     private fun handleSecureSessionAuthChallenge(text: String) {
+        val generation = sessionGeneration
         serviceScope.launch(Dispatchers.IO) {
             try {
+                if (generation != sessionGeneration || !sessionConnecting) return@launch
                 val msg = JSONObject(text)
                 when (msg.optString("type")) {
                     "auth_complete" -> {
+                        if (generation != sessionGeneration || !sessionConnecting) return@launch
                         require(msg.optString("scope") == "session") { "Unexpected auth completion scope" }
                         secureSessionAuthorized = true
                         sessionTimeoutJob?.cancel()
@@ -1071,10 +1097,19 @@ class WebRTCForegroundService : Service() {
                 val transcript = SecureLinkV4.sessionTranscript(scope, handshakeHash, pcStatic, phoneStatic, hwDer, fpPc, fpPhone, nonce, sessionId)
                 val signer = SecureLinkStrongBox(this@WebRTCForegroundService).prepareSignatureForBiometric(alias)
                 val callback = onSecureLinkAuthPrompt ?: error("Biometric UI is not attached")
+                if (generation != sessionGeneration || !sessionConnecting) {
+                    transcript.fill(0)
+                    return@launch
+                }
                 withContext(Dispatchers.Main) {
+                    if (generation != sessionGeneration || !sessionConnecting) {
+                        transcript.fill(0)
+                        return@withContext
+                    }
                     callback(signer) { authorizedSignature ->
                         serviceScope.launch(Dispatchers.IO) {
                             try {
+                                if (generation != sessionGeneration || !sessionConnecting) return@launch
                                 if (authorizedSignature == null) error("Biometric authorization cancelled")
                                 val signature = SecureLinkStrongBox(this@WebRTCForegroundService).finishSignature(authorizedSignature, transcript)
                                 val response = JSONObject().apply {
@@ -1083,11 +1118,14 @@ class WebRTCForegroundService : Service() {
                                     put("session_id", Base64.encodeToString(sessionId, Base64.NO_WRAP))
                                     put("signature", Base64.encodeToString(signature, Base64.NO_WRAP))
                                 }
+                                if (generation != sessionGeneration || !sessionConnecting) return@launch
                                 check(webrtc.sendSecureAuthText(response.toString())) { "Auth DataChannel is not open" }
                                 Log.i(TAG, "Secure Link v4 StrongBox auth response sent")
                             } catch (error: Throwable) {
                                 Log.e(TAG, "Secure Link v4 StrongBox authorization failed", error)
-                                failSecureLinkSession("StrongBox authorization failed")
+                                if (generation == sessionGeneration && sessionConnecting) {
+                                    failSecureLinkSession("StrongBox authorization failed")
+                                }
                             } finally {
                                 transcript.fill(0)
                             }
@@ -1096,13 +1134,22 @@ class WebRTCForegroundService : Service() {
                 }
             } catch (error: Throwable) {
                 Log.e(TAG, "Invalid Secure Link auth challenge", error)
-                failSecureLinkSession("Invalid auth challenge")
+                if (generation == sessionGeneration && sessionConnecting) {
+                    failSecureLinkSession("Invalid auth challenge")
+                }
             }
         }
     }
 
     private fun failSecureLinkSession(reason: String) {
         Log.e(TAG, "Secure Link v4 session failed: $reason")
+        val wasActive = sessionConnecting || sessionConnected || secureSessionRoom != null
+        // Invalidate timeout and asynchronous work associated with this attempt.
+        sessionGeneration++
+        sessionTimeoutJob?.cancel()
+        sessionTimeoutJob = null
+        sessionConnecting = false
+        sessionConnected = false
         secureSessionHelloPending = false
         secureSessionAuthorized = false
         secureSessionNoise?.close()
@@ -1119,14 +1166,24 @@ class WebRTCForegroundService : Service() {
         secureSessionFpPc = null
         secureSessionAlias = null
         try { webrtc.resetPeerConnection() } catch (_: Throwable) {}
-        if (sessionConnecting || sessionConnected) {
-            sessionConnecting = false
-            sessionConnected = false
-            sessionTimeoutJob?.cancel()
-            sessionTimeoutJob = null
+        if (wasActive) {
             currentVideoTrack = null
             onVideoTrackChanged?.invoke(null)
             onSessionState?.invoke(false, false)
+            if (reason != "user disconnected") {
+                onSessionError?.invoke(
+                    when (reason) {
+                        "Connection timeout" -> "Не удалось подключиться: истекло время ожидания"
+                        "signaling disconnected" -> "Соединение с сервером сигнализации потеряно"
+                        "Noise hello failed" -> "Не удалось установить защищённое соединение"
+                        "Noise reply or SDP answer invalid" -> "Компьютер вернул некорректный ответ"
+                        "StrongBox authorization failed" -> "Не удалось подтвердить подключение"
+                        "Invalid auth challenge" -> "Не удалось проверить запрос авторизации"
+                        "WebRTC initialization failed" -> "Не удалось инициализировать WebRTC"
+                        else -> "Не удалось подключиться ($reason)"
+                    }
+                )
+            }
         }
     }
 
@@ -1266,7 +1323,7 @@ class WebRTCForegroundService : Service() {
 
     fun disconnectSession() {
 
-        if (secureSessionRoom != null) {
+        if (secureSessionRoom != null || sessionConnecting || sessionConnected) {
             failSecureLinkSession("user disconnected")
             ws.close()
             return
@@ -1773,6 +1830,7 @@ class WebRTCForegroundService : Service() {
         onCursorPosition = null
         onSignalingState = null
         onSessionState = null
+        onSessionError = null
         onDirectSessionState = null
 
         pendingPairingPayload = null
