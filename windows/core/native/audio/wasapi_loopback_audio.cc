@@ -1,4 +1,4 @@
-﻿#include "wasapi_loopback_audio.h"
+#include "wasapi_loopback_audio.h"
 
 #ifdef _WIN32
 #include <windows.h>

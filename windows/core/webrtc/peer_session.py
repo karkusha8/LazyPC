@@ -8,12 +8,45 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import struct
 from typing import Callable
 
 from .native_connection import NativePeerConnection
 
 PACKET_CURSOR_POSITION = 0x60
+
+
+def _log_video_codecs(label: str, sdp: str) -> None:
+    """Log a compact video-codec summary without dumping SDP internals."""
+    in_video = False
+    payload_to_codec: dict[str, str] = {}
+    video_payloads: list[str] = []
+    direction = "unknown"
+
+    for raw_line in sdp.splitlines():
+        line = raw_line.strip()
+        if line.startswith("m="):
+            in_video = line.startswith("m=video ")
+            if in_video:
+                fields = line.split()
+                video_payloads = fields[3:]
+            continue
+        if not in_video:
+            continue
+        match = re.match(r"a=rtpmap:(\d+)\s+([^/\s]+)", line)
+        if match:
+            payload_to_codec[match.group(1)] = match.group(2)
+        elif line in ("a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"):
+            direction = line[2:]
+
+    codecs: list[str] = []
+    for payload in video_payloads:
+        codec = payload_to_codec.get(payload)
+        if codec and codec.lower() not in ("rtx", "red", "ulpfec", "flexfec-03") and codec not in codecs:
+            codecs.append(codec)
+    codec_summary = ", ".join(codecs) if codecs else "not listed"
+    print(f"[LazyPC-SDP] {label}: video codecs={codec_summary}; direction={direction}")
 
 
 class PeerConnection:
@@ -98,6 +131,7 @@ class PeerConnection:
         self._disconnect_notified = False
         transport = await self._ensure_started()
         self._remote_description_set = False
+        _log_video_codecs("REMOTE SECURE OFFER", sdp)
         await transport.set_remote_description("offer", sdp)
         self._remote_description_set = True
         # Android creates the dedicated auth channel before its offer. Windows
@@ -105,6 +139,7 @@ class PeerConnection:
         # on the same SCTP m-line without exposing authorization to commands.
         transport.create_control_channel()
         answer = await transport.create_answer()
+        _log_video_codecs("LOCAL SECURE ANSWER", answer)
         return answer
 
     async def _dispatch_text(self, text: str):
@@ -194,6 +229,7 @@ class PeerConnection:
             transport.create_control_channel()
         self._signaling_ready = False
         sdp = await transport.create_offer()  # native method sets local description
+        _log_video_codecs("LOCAL OFFER", sdp)
         await self.signaling.send_offer(sdp)
         await self._flush_local_candidates()
         return sdp
@@ -201,16 +237,19 @@ class PeerConnection:
     async def receive_offer(self, sdp: str):
         transport = await self._ensure_started()
         self._signaling_ready = False
+        _log_video_codecs("REMOTE OFFER", sdp)
         await transport.set_remote_description("offer", sdp)
         self._remote_description_set = True
         await self._flush_remote_candidates()
         answer = await transport.create_answer()  # native method sets local description
+        _log_video_codecs("LOCAL ANSWER", answer)
         await self.signaling.send_answer(answer)
         await self._flush_local_candidates()
         return answer
 
     async def receive_answer(self, sdp: str):
         transport = await self._ensure_started()
+        _log_video_codecs("REMOTE ANSWER", sdp)
         await transport.set_remote_description("answer", sdp)
         self._remote_description_set = True
         await self._flush_remote_candidates()

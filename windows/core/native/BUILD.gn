@@ -2,10 +2,20 @@ import("//webrtc.gni")
 
 rtc_shared_library("lazypc_webrtc") {
   sources = [
-    "native_peer.cc",
-    "native_peer.h",
-    "wasapi_loopback_audio.cc",
-    "wasapi_loopback_audio.h",
+    "webrtc/native_peer.cc",
+    "webrtc/native_peer.h",
+    "audio/wasapi_loopback_audio.cc",
+    "audio/wasapi_loopback_audio.h",
+    "video/d3d11_video_processor.cc",
+    "video/d3d11_video_processor.h",
+    "video/nvenc_video_encoder.cc",
+    "video/nvenc_video_encoder.h",
+  ]
+
+  include_dirs = [
+    ".",
+    "audio",
+    "video",
   ]
 
   deps = [
@@ -13,6 +23,7 @@ rtc_shared_library("lazypc_webrtc") {
     "//api:enable_media_with_defaults",
     "//api:peer_connection_interface",
     "//api/video:video_frame",
+    "//api/video_codecs:builtin_video_encoder_factory",
     "//modules/desktop_capture",
     "//pc:video_track_source",
     "//rtc_base:threading",
@@ -23,6 +34,9 @@ rtc_shared_library("lazypc_webrtc") {
     libs = [
       "ole32.lib",
       "uuid.lib",
+      "d3d11.lib",
+      "dxgi.lib",
+      "dxguid.lib",
     ]
   }
 }

@@ -1,4 +1,4 @@
-#include "native_peer.h"
+#include "webrtc/native_peer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +18,8 @@
 
 #include "api/create_modular_peer_connection_factory.h"
 #include "api/enable_media_with_defaults.h"
+#include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "video/nvenc_video_encoder.h"
 #include "api/audio/audio_device.h"
 #include "api/audio/create_audio_device_module.h"
 #include "api/environment/environment_factory.h"
@@ -26,6 +28,8 @@
 #include "api/jsep_ice_candidate.h"
 #include "api/make_ref_counted.h"
 #include "api/peer_connection_interface.h"
+#include "api/rtp_transceiver_interface.h"
+#include "api/rtp_parameters.h"
 #include "api/scoped_refptr.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
@@ -39,7 +43,7 @@
 #include "rtc_base/time_utils.h"
 #include "rtc_base/logging.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
-#include "wasapi_loopback_audio.h"
+#include "audio/wasapi_loopback_audio.h"
 #include "rtc_base/win32_socket_init.h"
 
 namespace {
@@ -58,6 +62,64 @@ webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
     g_peer_connection_factory;
 
 webrtc::scoped_refptr<webrtc::PeerConnectionInterface> g_peer_connection;
+
+// Prefer H.264 for the outgoing screen track so the custom encoder factory
+// can route it to NVIDIA NVENC. Keep other codecs as fallbacks.
+bool PreferH264ForVideoTransceivers() {
+  if (!g_peer_connection_factory || !g_peer_connection) {
+    std::fprintf(stderr, "[LazyPC-VIDEO] Cannot set codec preference: peer connection not ready\n");
+    return false;
+  }
+
+  auto capabilities =
+      g_peer_connection_factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+  auto& codecs = capabilities.codecs;
+
+  const bool has_h264 = std::any_of(
+      codecs.begin(), codecs.end(),
+      [](const webrtc::RtpCodecCapability& codec) {
+        return codec.name == "H264";
+      });
+  if (!has_h264) {
+    std::fprintf(stderr, "[LazyPC-VIDEO] H264 is absent from sender capabilities; keeping WebRTC defaults\n");
+    return false;
+  }
+
+  auto preference_rank = [](const std::string& name) {
+    if (name == "H264") return 0;
+    if (name == "VP8") return 1;
+    if (name == "VP9") return 2;
+    if (name == "AV1") return 3;
+    if (name == "rtx") return 4;
+    if (name == "red") return 5;
+    if (name == "ulpfec" || name == "flexfec-03") return 6;
+    return 7;
+  };
+  std::stable_sort(
+      codecs.begin(), codecs.end(),
+      [&](const webrtc::RtpCodecCapability& a,
+          const webrtc::RtpCodecCapability& b) {
+        return preference_rank(a.name) < preference_rank(b.name);
+      });
+
+  for (const auto& transceiver : g_peer_connection->GetTransceivers()) {
+    if (!transceiver ||
+        transceiver->media_type() != webrtc::MediaType::VIDEO) {
+      continue;
+    }
+    const auto error = transceiver->SetCodecPreferences(codecs);
+    if (error.ok()) {
+      std::fprintf(stderr, "[LazyPC-VIDEO] Video codec preference set: H264 first, VP8/VP9/AV1 fallback\n");
+      return true;
+    }
+    std::fprintf(stderr, "[LazyPC-VIDEO] SetCodecPreferences failed: %s\n",
+                 error.message());
+    return false;
+  }
+
+  std::fprintf(stderr, "[LazyPC-VIDEO] No video transceiver found for H264 preference\n");
+  return false;
+}
 
 webrtc::scoped_refptr<webrtc::DataChannelInterface> g_control_channel;
 webrtc::scoped_refptr<webrtc::DataChannelInterface> g_auth_channel;
@@ -108,6 +170,14 @@ class LazyFrameBroadcaster final
 
   void OnFrame(const webrtc::VideoFrame& frame) {
     std::lock_guard<std::mutex> lock(mutex_);
+    static std::atomic<unsigned int> logged_frames{0};
+    const unsigned int n = logged_frames.fetch_add(1, std::memory_order_relaxed);
+    if (n < 5) {
+      std::fprintf(stderr,
+                   "[LazyPC-VIDEO] Broadcaster frame #%u size=%dx%d sinks=%zu\n",
+                   n + 1, frame.width(), frame.height(), sinks_.size());
+      std::fflush(stderr);
+    }
     for (auto* sink : sinks_) {
       sink->OnFrame(frame);
     }
@@ -128,6 +198,8 @@ class LazyDesktopVideoSource : public webrtc::VideoTrackSource,
   ~LazyDesktopVideoSource() override { StopCapture(); }
 
   bool StartCapture() {
+    std::fprintf(stderr, "[LazyPC-VIDEO] StartCapture requested\n");
+    std::fflush(stderr);
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) {
       return true;
@@ -162,6 +234,15 @@ class LazyDesktopVideoSource : public webrtc::VideoTrackSource,
 
     const int width = frame->size().width();
     const int height = frame->size().height();
+    static std::atomic<unsigned int> logged_captures{0};
+    const unsigned int capture_n =
+        logged_captures.fetch_add(1, std::memory_order_relaxed);
+    if (capture_n < 5) {
+      std::fprintf(stderr,
+                   "[LazyPC-VIDEO] Desktop capture frame #%u size=%dx%d\n",
+                   capture_n + 1, width, height);
+      std::fflush(stderr);
+    }
     if (width < 2 || height < 2) {
       return;
     }
@@ -193,6 +274,12 @@ class LazyDesktopVideoSource : public webrtc::VideoTrackSource,
   void CaptureLoop() {
     webrtc::DesktopCaptureOptions options =
         webrtc::DesktopCaptureOptions::CreateDefault();
+#if defined(WEBRTC_WIN)
+    // Prefer WebRTC's DXGI/D3D11 Desktop Duplication capturer. This is the
+    // first part of the GPU capture path; frame conversion is still handled by
+    // the existing source until the D3D11 processor + NVENC path is connected.
+    options.set_allow_directx_capturer(true);
+#endif
     auto capturer = webrtc::DesktopCapturer::CreateScreenCapturer(options);
     if (!capturer) {
       PushEvent("video_error", "screen_capturer_create_failed");
@@ -213,6 +300,8 @@ class LazyDesktopVideoSource : public webrtc::VideoTrackSource,
     }
 
     capturer->Start(this);
+    std::fprintf(stderr, "[LazyPC-VIDEO] DesktopCapturer started\n");
+    std::fflush(stderr);
     PushEvent("video_capture", "started");
 
     auto next_frame = std::chrono::steady_clock::now();
@@ -704,10 +793,16 @@ int lazypc_webrtc_init() {
     return 0;
   }
 
-  // The modular factory is intentionally media-disabled unless media
-  // dependencies are configured. LazyPC sends desktop video and system audio
-  // tracks, so install WebRTC's built-in codec/media factories while keeping
-  // the physical recording device out of the configuration.
+  // Use LazyPC's NVENC-backed factory for H.264 and retain WebRTC's built-in
+  // factory for other supported codecs. Set it before EnableMediaWithDefaults,
+  // which only installs defaults when a dependency has not already been set.
+  std::fprintf(stderr, "[LazyPC-VIDEO] Installing encoder factory: H264 -> NVENC, other codecs -> WebRTC builtin\n");
+  std::fflush(stderr);
+  dependencies.video_encoder_factory = CreateLazyPcVideoEncoderFactory(
+      webrtc::CreateBuiltinVideoEncoderFactory());
+
+  // Install the remaining built-in media dependencies while keeping the
+  // physical recording device out of the configuration.
   webrtc::EnableMediaWithDefaults(dependencies);
 
   if (!dependencies.media_factory) {
@@ -724,6 +819,8 @@ int lazypc_webrtc_init() {
     return 0;
   }
 
+  std::fprintf(stderr, "[LazyPC-VIDEO] PeerConnectionFactory initialized; custom NVENC factory is configured\n");
+  std::fflush(stderr);
   g_initialized = true;
 
   PushEvent("initialized", "1");
@@ -1220,8 +1317,9 @@ int lazypc_webrtc_create_answer(char** out_sdp) {
   auto observer = webrtc::make_ref_counted<BlockingCreateDescriptionObserver>();
 
   g_signaling_thread->BlockingCall([observer]() {
+    // Configure codec preferences before CreateAnswer builds the negotiated SDP.
+    PreferH264ForVideoTransceivers();
     webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
-
     g_peer_connection->CreateAnswer(observer.get(), options);
   });
 
