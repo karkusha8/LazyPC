@@ -66,10 +66,13 @@ bool D3D11VideoProcessor::Initialize(ID3D11Device* device,
   texture_desc.SampleDesc.Count = 1;
   texture_desc.Usage = D3D11_USAGE_DEFAULT;
   texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-  if (FAILED(device_->CreateTexture2D(&texture_desc, nullptr, &output_texture_))) {
-    Release();
-    return false;
+  for (auto& output_texture : output_textures_) {
+    if (FAILED(device_->CreateTexture2D(&texture_desc, nullptr, &output_texture))) {
+      Release();
+      return false;
+    }
   }
+  next_output_texture_ = 0;
   return true;
 }
 
@@ -107,12 +110,13 @@ bool D3D11VideoProcessor::Process(ID3D11Texture2D* input,
     return false;
   }
 
+  auto& current_output_texture = output_textures_[next_output_texture_];
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> output_view;
   D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_view_desc{};
   output_view_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
   output_view_desc.Texture2D.MipSlice = 0;
   if (FAILED(video_device_->CreateVideoProcessorOutputView(
-          output_texture_.Get(), enumerator_.Get(), &output_view_desc,
+          current_output_texture.Get(), enumerator_.Get(), &output_view_desc,
           &output_view))) {
     return false;
   }
@@ -136,13 +140,15 @@ bool D3D11VideoProcessor::Process(ID3D11Texture2D* input,
     return false;
   }
 
-  *output_texture = output_texture_.Get();
+  *output_texture = current_output_texture.Get();
   (*output_texture)->AddRef();
+  next_output_texture_ = (next_output_texture_ + 1) % output_textures_.size();
   return true;
 }
 
 void D3D11VideoProcessor::Release() {
-  output_texture_.Reset();
+  for (auto& output_texture : output_textures_) output_texture.Reset();
+  next_output_texture_ = 0;
   processor_.Reset();
   enumerator_.Reset();
   video_context_.Reset();

@@ -1,8 +1,9 @@
-﻿#include "nvenc_video_encoder.h"
+#include "nvenc_video_encoder.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d10.h>
 #include <dxgi.h>
 #include <wrl/client.h>
 #endif
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +28,8 @@
 #include "api/environment/environment.h"
 #include "third_party/nvcodec/nvEncodeAPI.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
+#include "d3d11_video_processor.h"
+#include "modules/desktop_capture/win/dxgi_gpu_frame_observer.h"
 
 namespace {
 
@@ -46,6 +50,36 @@ const D3D_FEATURE_LEVEL* GetFeatureLevelsAfterFirst(const D3D_FEATURE_LEVEL* lev
 #pragma clang diagnostic pop
   return result;
 }
+
+// Holds the D3D11 device lock (ID3D10Multithread::Enter/Leave). NVENC talks to
+// the driver directly, so D3D11's per-call locking does not cover the whole
+// VideoProcessorBlt -> nvEncMapInputResource -> nvEncEncodePicture sequence.
+// Without holding the device lock across it, the DXGI capture thread
+// (CopyResource/CreateTexture2D on the same immediate context) interleaves and
+// the driver can deadlock inside nvEncMapInputResource.
+class D3dDeviceLock {
+ public:
+  explicit D3dDeviceLock(ID3D10Multithread* mt) : mt_(mt) { Lock(); }
+  ~D3dDeviceLock() { Unlock(); }
+  D3dDeviceLock(const D3dDeviceLock&) = delete;
+  D3dDeviceLock& operator=(const D3dDeviceLock&) = delete;
+  void Lock() {
+    if (mt_ && !held_) {
+      mt_->Enter();
+      held_ = true;
+    }
+  }
+  void Unlock() {
+    if (mt_ && held_) {
+      mt_->Leave();
+      held_ = false;
+    }
+  }
+
+ private:
+  ID3D10Multithread* mt_;
+  bool held_ = false;
+};
 
 class NvencEncoder final : public webrtc::VideoEncoder {
  public:
@@ -72,21 +106,15 @@ class NvencEncoder final : public webrtc::VideoEncoder {
       ReleaseLocked();
       return kVideoCodecError;
     }
-    if (!CreateD3DDeviceLocked()) {
-      std::fprintf(stderr, "[LazyPC-VIDEO] ERROR: could not create D3D11 device on NVIDIA adapter\n");
-      std::fflush(stderr);
-      ReleaseLocked();
-      return kVideoCodecError;
-    }
-    if (!OpenEncoderLocked()) {
-      std::fprintf(stderr, "[LazyPC-VIDEO] ERROR: NVENC H.264 initialization failed; see preceding NVENC step/status\n");
-      std::fflush(stderr);
-      ReleaseLocked();
-      return kVideoCodecError;
-    }
+    // Defer opening the NVENC session until Encode() can select the actual
+    // DXGI capture device. NVENC D3D11 resources must belong to the device used
+    // to open the session; opening on a second device would defeat zero-copy.
     initialized_ = true;
-    std::fprintf(stderr, "[LazyPC-VIDEO] ACTIVE ENCODER: NVIDIA NVENC H.264, %ux%u, ultra-low-latency, CBR, no B-frames\n",
-                 width_, height_);
+    gpu_init_wait_frames_ = 0;
+    gpu_path_logged_ = false;
+    webrtc::EnableDxgiGpuFrameQueue(true);
+    std::fprintf(stderr,
+                 "[LazyPC-VIDEO] NVENC API ready; waiting for DXGI GPU frame to select D3D11 device\n");
     std::fflush(stderr);
     return kVideoCodecOk;
   }
@@ -108,12 +136,98 @@ class NvencEncoder final : public webrtc::VideoEncoder {
                  const std::vector<webrtc::VideoFrameType>* frame_types) override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || !callback_) return kVideoCodecUninitialized;
+
+    const bool gpu_only_capture = webrtc::IsDxgiGpuOnlyCaptureEnabled();
+    webrtc::DxgiGpuFrame gpu_frame;
+    const bool have_new_gpu_frame = TryPopDxgiGpuFrame(&gpu_frame);
+    if (have_new_gpu_frame) {
+      // Retain the most recent owned DXGI texture. Desktop Duplication only
+      // publishes a new texture when the desktop changes; WebRTC still asks
+      // the encoder for frames at its target cadence. Reuse the last captured
+      // texture between updates instead of dropping every frame on an empty
+      // queue (which starves the remote video stream).
+      last_gpu_frame_ = gpu_frame;
+      have_last_gpu_frame_ = true;
+    } else if (gpu_only_capture && have_last_gpu_frame_ &&
+               last_gpu_frame_.texture && last_gpu_frame_.device) {
+      gpu_frame = last_gpu_frame_;
+    }
+    const bool have_gpu_frame = have_new_gpu_frame ||
+        (gpu_only_capture && have_last_gpu_frame_ && gpu_frame.texture && gpu_frame.device);
+    if (!encoder_) {
+      bool opened = false;
+      if (have_gpu_frame && gpu_frame.device) {
+        opened = OpenEncoderOnDeviceLocked(gpu_frame.device.Get());
+        if (!opened) {
+          CloseEncoderSessionLocked();
+          std::fprintf(stderr,
+                       "[LazyPC-GPU] NVENC could not open on DXGI device; trying CPU-fallback device\n");
+          std::fflush(stderr);
+        }
+      }
+      // The DXGI observer is normally called before the corresponding CPU
+      // DesktopFrame reaches WebRTC. Allow a short startup window for it. If
+      // GPU capture is unavailable, preserve the established CPU input path.
+      if (!opened && !have_gpu_frame && gpu_init_wait_frames_++ < 12) {
+        return kVideoCodecOk;
+      }
+      if (!opened) {
+        if (!CreateD3DDeviceLocked() ||
+            !OpenEncoderOnDeviceLocked(d3d_device_.Get())) {
+          CloseEncoderSessionLocked();
+          return kVideoCodecError;
+        }
+      }
+      std::fprintf(stderr,
+                   "[LazyPC-VIDEO] NVENC session opened; device selected from %s\n",
+                   have_gpu_frame ? "DXGI capture frame" : "CPU fallback path");
+      std::fflush(stderr);
+    }
+
+    const uint64_t encoded_before_gpu_attempt = encoded_frames_;
+    if (have_gpu_frame && EncodeGpuFrameLocked(gpu_frame, frame, frame_types)) {
+      // Do not switch capture to zero-readback just because NVENC accepted an
+      // input. NVENC can return NEED_MORE_INPUT without producing a bitstream;
+      // GPU-only mode is safe only after a real encoded frame reached WebRTC.
+      const bool produced_bitstream = encoded_frames_ > encoded_before_gpu_attempt;
+      if (!gpu_only_capture && produced_bitstream) {
+        webrtc::EnableDxgiGpuOnlyCapture(true);
+        std::fprintf(stderr,
+                     "[LazyPC-GPU] zero-readback capture enabled after first encoded bitstream\n");
+        std::fflush(stderr);
+      }
+      return kVideoCodecOk;
+    }
+
+    if (gpu_only_capture && !have_gpu_frame) {
+      // Capture and encoding run on different threads, so the GPU-frame queue
+      // can be briefly empty. In zero-readback mode the WebRTC frame is only a
+      // placeholder; drop it but do not disable GPU-only capture on a queue miss.
+      // Otherwise transient timing gaps cause repeated GPU/CPU mode oscillation.
+      return kVideoCodecOk;
+    }
+
+    if (gpu_only_capture) {
+      std::fprintf(stderr,
+                   "[LazyPC-VIDEO-DIAG] GPU encode failed with a GPU frame present; encoded=%llu\n",
+                   static_cast<unsigned long long>(encoded_frames_));
+      std::fflush(stderr);
+      // A GPU frame existed but GPU encoding failed. Restore CPU readback so
+      // subsequent frames can use the CPU fallback rather than a placeholder.
+      webrtc::EnableDxgiGpuOnlyCapture(false);
+      std::fprintf(stderr,
+                   "[LazyPC-GPU] GPU encode failed for available GPU frame; zero-readback capture disabled, resuming CPU fallback\n");
+      std::fflush(stderr);
+      return kVideoCodecOk;
+    }
+
+    // CPU fallback remains unchanged: WebRTC's I420 frame is converted into
+    // NVENC's system-memory NV12 input buffer with libyuv.
     const auto buffer = frame.video_frame_buffer()->ToI420();
     if (!buffer || buffer->width() != static_cast<int>(width_) ||
         buffer->height() != static_cast<int>(height_)) {
       return kVideoCodecErrParameter;
     }
-
     NV_ENC_LOCK_INPUT_BUFFER lock_input{};
     lock_input.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
     lock_input.inputBuffer = input_buffer_;
@@ -121,8 +235,6 @@ class NvencEncoder final : public webrtc::VideoEncoder {
       return kVideoCodecError;
     }
     auto* y = static_cast<uint8_t*>(lock_input.bufferDataPtr);
-    // NVENC mapped output is a contiguous pitched buffer (Y plane followed by UV).
-    // The pointer offset is required by the NVENC API buffer layout.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
     auto* uv = y + static_cast<size_t>(lock_input.pitch) * height_;
@@ -137,76 +249,7 @@ class NvencEncoder final : public webrtc::VideoEncoder {
     if (convert_result != 0 || unlock_status != NV_ENC_SUCCESS) {
       return kVideoCodecError;
     }
-
-    NV_ENC_PIC_PARAMS pic{};
-    pic.version = NV_ENC_PIC_PARAMS_VER;
-    pic.inputBuffer = input_buffer_;
-    pic.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
-    pic.inputWidth = width_;
-    pic.inputHeight = height_;
-    pic.outputBitstream = bitstream_buffer_;
-    pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    pic.inputTimeStamp = frame.timestamp_us();
-    bool force_keyframe = false;
-    if (frame_types && !frame_types->empty()) {
-      force_keyframe = (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
-    }
-    if (force_keyframe) {
-      pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
-    }
-const NVENCSTATUS encode_status = api_.nvEncEncodePicture(encoder_, &pic);
-    if (encode_status != NV_ENC_SUCCESS && encode_status != NV_ENC_ERR_NEED_MORE_INPUT) {
-      return kVideoCodecError;
-    }
-    if (encode_status == NV_ENC_ERR_NEED_MORE_INPUT) return kVideoCodecOk;
-
-    NV_ENC_LOCK_BITSTREAM lock_bits{};
-    lock_bits.version = NV_ENC_LOCK_BITSTREAM_VER;
-    lock_bits.outputBitstream = bitstream_buffer_;
-    lock_bits.doNotWait = 0;
-const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
-    if (lock_status != NV_ENC_SUCCESS) return kVideoCodecError;
-
-    const size_t bytes = lock_bits.bitstreamSizeInBytes;
-    auto encoded_buffer = webrtc::EncodedImageBuffer::Create(bytes);
-    if (encoded_buffer && bytes > 0) {
-      std::memcpy(encoded_buffer->data(), lock_bits.bitstreamBufferPtr, bytes);
-    }
-    const NVENCSTATUS unlock_bits_status =
-        api_.nvEncUnlockBitstream(encoder_, bitstream_buffer_);
-    if (!encoded_buffer || bytes == 0 || unlock_bits_status != NV_ENC_SUCCESS) {
-      return kVideoCodecError;
-    }
-
-    webrtc::EncodedImage encoded;
-    encoded.SetEncodedData(encoded_buffer);
-    encoded._encodedWidth = static_cast<int>(width_);
-    encoded._encodedHeight = static_cast<int>(height_);
-    encoded.SetRtpTimestamp(frame.rtp_timestamp());
-    encoded.SetFrameType((lock_bits.pictureType == NV_ENC_PIC_TYPE_IDR || force_keyframe)
-                             ? webrtc::VideoFrameType::kVideoFrameKey
-                             : webrtc::VideoFrameType::kVideoFrameDelta);
-    // The RTP payload pipeline uses codec-specific metadata to select the
-    // matching RTPVideoHeader variant. Passing nullptr leaves that header
-    // untyped; the H.264 send path can then throw std::bad_variant_access.
-    webrtc::CodecSpecificInfo codec_specific_info{};
-    codec_specific_info.codecType = webrtc::kVideoCodecH264;
-    const auto callback_result =
-        callback_->OnEncodedImage(encoded, &codec_specific_info);
-    if (callback_result.error != webrtc::EncodedImageCallback::Result::OK) {
-      std::fprintf(stderr,
-                   "[LazyPC-VIDEO] OnEncodedImage reported error=%d\\n",
-                   static_cast<int>(callback_result.error));
-      std::fflush(stderr);
-    }
-    ++encoded_frames_;
-    if (encoded_frames_ == 1) {
-      std::fprintf(stderr,
-                   "[LazyPC-VIDEO] NVENC ENCODED frames=%llu last_frame=%ux%u bytes=%zu\n",
-                   static_cast<unsigned long long>(encoded_frames_), width_, height_, bytes);
-      std::fflush(stderr);
-    }
-    return kVideoCodecOk;
+    return SubmitInputLocked(input_buffer_, frame, frame_types);
   }
 
   void SetRates(const RateControlParameters& parameters) override {
@@ -228,10 +271,16 @@ const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
     reconfigure.reInitEncodeParams = init_params_;
     reconfigure.reInitEncodeParams.frameRateNum = fps_;
     reconfigure.reInitEncodeParams.encodeConfig = &config_;
-    reconfigure.resetEncoder = 1;
+    // Rate-only changes must not reset the NVENC session. Resetting the
+    // encoder while WebRTC continuously submits frames can interrupt the
+    // stream; keep the session alive and reconfigure bitrate/framerate only.
+    reconfigure.resetEncoder = 0;
     reconfigure.forceIDR = 0;
-    api_.nvEncReconfigureEncoder(encoder_, &reconfigure);
-    init_params_ = reconfigure.reInitEncodeParams;
+    const NVENCSTATUS reconfigure_status =
+        api_.nvEncReconfigureEncoder(encoder_, &reconfigure);
+    if (reconfigure_status == NV_ENC_SUCCESS) {
+      init_params_ = reconfigure.reInitEncodeParams;
+    }
   }
 
   EncoderInfo GetEncoderInfo() const override {
@@ -244,6 +293,237 @@ const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
   }
 
  private:
+  struct GpuRegisteredResource {
+    ID3D11Texture2D* texture = nullptr;  // Owned by D3D11VideoProcessor.
+    NV_ENC_REGISTERED_PTR registered = nullptr;
+  };
+
+  bool EncodeGpuFrameLocked(const webrtc::DxgiGpuFrame& gpu_frame,
+                            const webrtc::VideoFrame& frame,
+                            const std::vector<webrtc::VideoFrameType>* frame_types) {
+    if (!gpu_frame.texture || !gpu_frame.device ||
+        gpu_frame.device.Get() != d3d_device_.Get()) {
+      if (!gpu_path_logged_) {
+        std::fprintf(stderr,
+                     "[LazyPC-GPU] GPU frame device does not match NVENC session device; using CPU fallback\n");
+        std::fflush(stderr);
+        gpu_path_logged_ = true;
+      }
+      return false;
+    }
+    if (gpu_frame.format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        gpu_frame.format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+      return false;
+    }
+
+    // Serialize every use of the shared immediate context/driver with the DXGI
+    // capture thread for the whole GPU sequence (released before the WebRTC
+    // callback in SubmitInputLocked, re-taken for Unmap).
+    D3dDeviceLock device_lock(d3d_multithread_.Get());
+
+    if (!video_processor_ || vp_input_width_ != gpu_frame.width ||
+        vp_input_height_ != gpu_frame.height) {
+      for (auto& resource : gpu_registered_resources_) {
+        if (resource.registered && encoder_) {
+          api_.nvEncUnregisterResource(encoder_, resource.registered);
+        }
+      }
+      gpu_registered_resources_.clear();
+      if (video_processor_) video_processor_->Release();
+      video_processor_ = std::make_unique<lazypc::D3D11VideoProcessor>();
+      if (!video_processor_->Initialize(d3d_device_.Get(), d3d_context_.Get(),
+                                        gpu_frame.width, gpu_frame.height,
+                                        width_, height_)) {
+        video_processor_.reset();
+        return false;
+      }
+      vp_input_width_ = gpu_frame.width;
+      vp_input_height_ = gpu_frame.height;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12_texture;
+    RECT crop{0, 0, static_cast<LONG>(gpu_frame.width),
+              static_cast<LONG>(gpu_frame.height)};
+    if (!video_processor_->Process(gpu_frame.texture.Get(), &crop,
+                                   nv12_texture.GetAddressOf())) {
+      std::fprintf(stderr, "[LazyPC-GPU] VideoProcessor Process failed\n");
+      std::fflush(stderr);
+      return false;
+    }
+
+    // Keep a persistent NVENC registration for each rotating D3D11 surface.
+    auto resource_it = std::find_if(
+        gpu_registered_resources_.begin(), gpu_registered_resources_.end(),
+        [&nv12_texture](const GpuRegisteredResource& resource) {
+          return resource.texture == nv12_texture.Get();
+        });
+    if (resource_it == gpu_registered_resources_.end()) {
+      NV_ENC_REGISTER_RESOURCE reg{};
+      reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+      reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+      reg.resourceToRegister = nv12_texture.Get();
+      reg.width = width_;
+      reg.height = height_;
+      reg.pitch = 0;
+      reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+      reg.subResourceIndex = 0;
+      const NVENCSTATUS status = api_.nvEncRegisterResource(encoder_, &reg);
+      if (status != NV_ENC_SUCCESS) {
+        std::fprintf(stderr,
+                     "[LazyPC-GPU] nvEncRegisterResource failed status=%d\n",
+                     static_cast<int>(status));
+        std::fflush(stderr);
+        return false;
+      }
+      gpu_registered_resources_.push_back(
+          GpuRegisteredResource{nv12_texture.Get(), reg.registeredResource});
+      resource_it = std::prev(gpu_registered_resources_.end());
+    }
+
+    NV_ENC_MAP_INPUT_RESOURCE map{};
+    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    map.registeredResource = resource_it->registered;
+    const NVENCSTATUS map_status = api_.nvEncMapInputResource(encoder_, &map);
+    if (map_status != NV_ENC_SUCCESS) {
+      std::fprintf(stderr, "[LazyPC-GPU] nvEncMapInputResource failed status=%d\n",
+                   static_cast<int>(map_status));
+      std::fflush(stderr);
+      return false;
+    }
+
+    if (!gpu_path_logged_) {
+      std::fprintf(stderr,
+                   "[LazyPC-GPU] GPU path active: DXGI BGRA -> D3D11 VideoProcessor NV12 -> NVENC texture input\n");
+      std::fflush(stderr);
+      gpu_path_logged_ = true;
+    }
+    const int32_t result =
+        SubmitInputLocked(map.mappedResource, frame, frame_types, &device_lock);
+    const NVENCSTATUS unmap_status =
+        api_.nvEncUnmapInputResource(encoder_, map.mappedResource);
+    if (unmap_status != NV_ENC_SUCCESS) {
+      std::fprintf(stderr, "[LazyPC-GPU] nvEncUnmapInputResource failed status=%d\n",
+                   static_cast<int>(unmap_status));
+      std::fflush(stderr);
+    }
+    return result == kVideoCodecOk;
+  }
+
+  int32_t SubmitInputLocked(NV_ENC_INPUT_PTR input,
+                            const webrtc::VideoFrame& frame,
+                            const std::vector<webrtc::VideoFrameType>* frame_types,
+                            D3dDeviceLock* device_lock = nullptr) {
+    NV_ENC_PIC_PARAMS pic{};
+    pic.version = NV_ENC_PIC_PARAMS_VER;
+    pic.inputBuffer = input;
+    pic.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+    pic.inputWidth = width_;
+    pic.inputHeight = height_;
+    pic.outputBitstream = bitstream_buffer_;
+    pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+    pic.inputTimeStamp = frame.timestamp_us();
+    bool force_keyframe = false;
+    if (frame_types && !frame_types->empty()) {
+      force_keyframe = (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
+    }
+    if (force_keyframe) {
+      pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+    }
+    const NVENCSTATUS encode_status = api_.nvEncEncodePicture(encoder_, &pic);
+    if (encode_status != NV_ENC_SUCCESS && encode_status != NV_ENC_ERR_NEED_MORE_INPUT) {
+      std::fprintf(stderr,
+                   "[LazyPC-GPU-DIAG] nvEncEncodePicture failed status=%d encoded=%llu\n",
+                   static_cast<int>(encode_status),
+                   static_cast<unsigned long long>(encoded_frames_));
+      std::fflush(stderr);
+      return kVideoCodecError;
+    }
+    if (encode_status == NV_ENC_ERR_NEED_MORE_INPUT) {
+      if (encoded_frames_ < 5 || (encoded_frames_ % 120) == 0) {
+        std::fprintf(stderr,
+                     "[LazyPC-GPU-DIAG] nvEncEncodePicture NEED_MORE_INPUT encoded=%llu\n",
+                     static_cast<unsigned long long>(encoded_frames_));
+        std::fflush(stderr);
+      }
+      return kVideoCodecOk;
+    }
+
+    NV_ENC_LOCK_BITSTREAM lock_bits{};
+    lock_bits.version = NV_ENC_LOCK_BITSTREAM_VER;
+    lock_bits.outputBitstream = bitstream_buffer_;
+    lock_bits.doNotWait = 0;
+    const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
+    if (lock_status != NV_ENC_SUCCESS) {
+      std::fprintf(stderr,
+                   "[LazyPC-GPU-DIAG] nvEncLockBitstream failed status=%d encoded=%llu\n",
+                   static_cast<int>(lock_status),
+                   static_cast<unsigned long long>(encoded_frames_));
+      std::fflush(stderr);
+      return kVideoCodecError;
+    }
+
+    const size_t bytes = lock_bits.bitstreamSizeInBytes;
+    auto encoded_buffer = webrtc::EncodedImageBuffer::Create(bytes);
+    if (encoded_buffer && bytes > 0) {
+      std::memcpy(encoded_buffer->data(), lock_bits.bitstreamBufferPtr, bytes);
+    }
+    const NVENCSTATUS unlock_bits_status =
+        api_.nvEncUnlockBitstream(encoder_, bitstream_buffer_);
+    if (!encoded_buffer || bytes == 0 || unlock_bits_status != NV_ENC_SUCCESS) {
+      return kVideoCodecError;
+    }
+
+    webrtc::EncodedImage encoded;
+    encoded.SetEncodedData(encoded_buffer);
+    encoded._encodedWidth = static_cast<int>(width_);
+    encoded._encodedHeight = static_cast<int>(height_);
+    encoded.SetRtpTimestamp(frame.rtp_timestamp());
+    encoded.SetFrameType((lock_bits.pictureType == NV_ENC_PIC_TYPE_IDR || force_keyframe)
+                             ? webrtc::VideoFrameType::kVideoFrameKey
+                             : webrtc::VideoFrameType::kVideoFrameDelta);
+    webrtc::CodecSpecificInfo codec_specific_info{};
+    codec_specific_info.codecType = webrtc::kVideoCodecH264;
+    // Never call into WebRTC (packetizer/pacer locks) while holding the D3D
+    // device lock: that would create a lock-order inversion with the capture thread.
+    if (device_lock) device_lock->Unlock();
+    const auto callback_result = callback_->OnEncodedImage(encoded, &codec_specific_info);
+    if (device_lock) device_lock->Lock();
+    if (callback_result.error != webrtc::EncodedImageCallback::Result::OK) {
+      std::fprintf(stderr, "[LazyPC-VIDEO] OnEncodedImage reported error=%d\n",
+                   static_cast<int>(callback_result.error));
+      std::fflush(stderr);
+    }
+    ++encoded_frames_;
+    if (encoded_frames_ == 1) {
+      std::fprintf(stderr,
+                   "[LazyPC-VIDEO] NVENC ENCODED first frame size=%ux%u bytes=%zu\n",
+                   width_, height_, bytes);
+      std::fflush(stderr);
+    }
+    return kVideoCodecOk;
+  }
+
+  void CloseEncoderSessionLocked() {
+    D3dDeviceLock device_lock(d3d_multithread_.Get());
+    for (auto& resource : gpu_registered_resources_) {
+      if (resource.registered && encoder_) {
+        api_.nvEncUnregisterResource(encoder_, resource.registered);
+      }
+    }
+    gpu_registered_resources_.clear();
+    if (video_processor_) video_processor_->Release();
+    video_processor_.reset();
+    vp_input_width_ = vp_input_height_ = 0;
+    if (encoder_) {
+      if (bitstream_buffer_) api_.nvEncDestroyBitstreamBuffer(encoder_, bitstream_buffer_);
+      if (input_buffer_) api_.nvEncDestroyInputBuffer(encoder_, input_buffer_);
+      api_.nvEncDestroyEncoder(encoder_);
+    }
+    encoder_ = nullptr;
+    input_buffer_ = nullptr;
+    bitstream_buffer_ = nullptr;
+  }
+
   bool LoadApiLocked() {
     if (nvenc_module_) return true;
     nvenc_module_ = LoadLibraryW(L"nvEncodeAPI64.dll");
@@ -322,7 +602,17 @@ const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
     return SUCCEEDED(hr);
   }
 
-  bool OpenEncoderLocked() {
+  bool OpenEncoderOnDeviceLocked(ID3D11Device* device) {
+    if (!device) return false;
+    if (encoder_) return d3d_device_.Get() == device;
+    d3d_device_ = device;
+    d3d_device_->GetImmediateContext(&d3d_context_);
+    // The DXGI capturer and the video processor may use this immediate context
+    // from different threads. Enable D3D11's context serialization.
+    d3d_multithread_.Reset();
+    if (SUCCEEDED(d3d_device_.As(&d3d_multithread_)) && d3d_multithread_) {
+      d3d_multithread_->SetMultithreadProtected(TRUE);
+    }
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS open{};
     open.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     open.device = d3d_device_.Get();
@@ -414,16 +704,16 @@ const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
 
   void ReleaseLocked() {
     initialized_ = false;
-    if (encoder_) {
-      if (bitstream_buffer_) api_.nvEncDestroyBitstreamBuffer(encoder_, bitstream_buffer_);
-      if (input_buffer_) api_.nvEncDestroyInputBuffer(encoder_, input_buffer_);
-      api_.nvEncDestroyEncoder(encoder_);
-    }
-    encoder_ = nullptr;
-    input_buffer_ = nullptr;
-    bitstream_buffer_ = nullptr;
+    webrtc::EnableDxgiGpuFrameQueue(false);
+    webrtc::EnableDxgiGpuOnlyCapture(false);
+    CloseEncoderSessionLocked();
     d3d_context_.Reset();
+    d3d_multithread_.Reset();
     d3d_device_.Reset();
+    gpu_init_wait_frames_ = 0;
+    gpu_path_logged_ = false;
+    last_gpu_frame_ = webrtc::DxgiGpuFrame{};
+    have_last_gpu_frame_ = false;
     if (nvenc_module_) {
       FreeLibrary(nvenc_module_);
       nvenc_module_ = nullptr;
@@ -445,6 +735,15 @@ const NVENCSTATUS lock_status = api_.nvEncLockBitstream(encoder_, &lock_bits);
   NV_ENC_INITIALIZE_PARAMS init_params_{};
   ComPtr<ID3D11Device> d3d_device_;
   ComPtr<ID3D11DeviceContext> d3d_context_;
+  ComPtr<ID3D10Multithread> d3d_multithread_;
+  std::unique_ptr<lazypc::D3D11VideoProcessor> video_processor_;
+  std::vector<GpuRegisteredResource> gpu_registered_resources_;
+  uint32_t vp_input_width_ = 0;
+  uint32_t vp_input_height_ = 0;
+  uint32_t gpu_init_wait_frames_ = 0;
+  bool gpu_path_logged_ = false;
+  webrtc::DxgiGpuFrame last_gpu_frame_;
+  bool have_last_gpu_frame_ = false;
 };
 #else
 class NvencEncoder final : public webrtc::VideoEncoder {
@@ -500,7 +799,7 @@ class LazyPcEncoderFactory final : public webrtc::VideoEncoderFactory {
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateLazyPcVideoEncoderFactory(
     std::unique_ptr<webrtc::VideoEncoderFactory> fallback) {
   std::fprintf(stderr,
-               "[LazyPC-VIDEO] Encoder policy: H264-only; non-H264 encoders disabled to force NVENC path\\n");
+               "[LazyPC-VIDEO] Encoder policy: H264-only; non-H264 encoders disabled to force NVENC path\n");
   std::fflush(stderr);
   return std::make_unique<LazyPcEncoderFactory>(std::move(fallback));
 }

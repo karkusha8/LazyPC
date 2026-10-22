@@ -3,6 +3,8 @@
 #ifdef _WIN32
 
 #include <cstdint>
+#include <array>
+#include <cstddef>
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <wrl/client.h>
@@ -38,7 +40,9 @@ class D3D11VideoProcessor final {
   Microsoft::WRL::ComPtr<ID3D11VideoContext> video_context_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> enumerator_;
   Microsoft::WRL::ComPtr<ID3D11VideoProcessor> processor_;
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> output_texture_;
+  // Rotating NV12 surfaces reduce immediate reuse while NVENC may still consume a frame.
+  std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 3> output_textures_{};
+  size_t next_output_texture_ = 0;
   uint32_t input_width_ = 0;
   uint32_t input_height_ = 0;
   uint32_t output_width_ = 0;

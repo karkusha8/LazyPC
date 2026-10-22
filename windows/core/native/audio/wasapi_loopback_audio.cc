@@ -123,6 +123,10 @@ void LazyWasapiLoopbackAudio::CaptureLoop() {
   }
   OutputDebugStringA("[LazyPC audio] WASAPI loopback started\n");
   NotifyEvent("audio_capture", "started");
+  constexpr size_t kChunkFrames = 480;            // 10 ms at 48 kHz
+  constexpr size_t kChunkSamples = kChunkFrames * 2;  // interleaved stereo
+  std::vector<int16_t> pending;
+  pending.reserve(kChunkSamples * 8);
   while (running_.load(std::memory_order_acquire)) {
     UINT32 packet = 0;
     hr = capture->GetNextPacketSize(&packet);
@@ -159,7 +163,23 @@ void LazyWasapiLoopbackAudio::CaptureLoop() {
           }
         }
       }
-      Publish(pcm.data(), frames);
+      // WebRTC's AudioTrackSink/ChannelSend path (ACM::Add10MsData) accepts only
+      // exact 10 ms blocks (480 frames at 48 kHz). WASAPI packets have arbitrary
+      // length, so accumulate and publish fixed 480-frame chunks.
+      pending.insert(pending.end(), pcm.begin(), pcm.end());
+      size_t offset = 0;
+      while (pending.size() - offset >= kChunkSamples) {
+        // std::span::subspan expresses the bounded chunk without raw pointer
+        // arithmetic, satisfying Clang's -Wunsafe-buffer-usage diagnostic.
+        const std::span<const int16_t> pending_samples(pending);
+        Publish(pending_samples.subspan(offset, kChunkSamples).data(),
+                kChunkFrames);
+        offset += kChunkSamples;
+      }
+      if (offset) {
+        pending.erase(pending.begin(),
+                      pending.begin() + static_cast<std::ptrdiff_t>(offset));
+      }
       capture->ReleaseBuffer(frames);
       hr = capture->GetNextPacketSize(&packet);
       if (FAILED(hr)) break;
@@ -184,6 +204,3 @@ void LazyWasapiLoopbackAudio::Stop() {}
 void LazyWasapiLoopbackAudio::CaptureLoop() {}
 void LazyWasapiLoopbackAudio::Publish(const int16_t*, size_t) {}
 #endif
-
-
-

@@ -38,6 +38,9 @@
 #include "modules/desktop_capture/desktop_capture_options.h"
 #include "modules/desktop_capture/desktop_capturer.h"
 #include "modules/desktop_capture/desktop_frame.h"
+#if defined(WEBRTC_WIN)
+#include "modules/desktop_capture/win/dxgi_gpu_frame_observer.h"
+#endif
 #include "pc/video_track_source.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/time_utils.h"
@@ -247,18 +250,49 @@ class LazyDesktopVideoSource : public webrtc::VideoTrackSource,
       return;
     }
 
-    auto buffer = webrtc::I420Buffer::Create(width, height);
-    const int convert_result = libyuv::ConvertToI420(
-        frame->data(), static_cast<size_t>(frame->stride()) * height,
-        buffer->MutableDataY(), buffer->StrideY(),
-        buffer->MutableDataU(), buffer->StrideU(),
-        buffer->MutableDataV(), buffer->StrideV(),
-        0, 0, width, height, width, height, libyuv::kRotate0,
-        static_cast<uint32_t>(frame->pixel_format()));
-    if (convert_result != 0) {
-      PushEvent("video_error", "bgra_to_i420_failed:" +
-                                   std::to_string(convert_result));
-      return;
+    webrtc::scoped_refptr<webrtc::I420Buffer> buffer;
+    bool gpu_only_capture = false;
+#if defined(WEBRTC_WIN)
+    gpu_only_capture = webrtc::IsDxgiGpuOnlyCaptureEnabled();
+#endif
+    if (gpu_only_capture) {
+      // The CPU DesktopFrame is only a scheduling placeholder while the NVENC
+      // encoder consumes the real DXGI texture from the GPU queue. Cache one
+      // neutral I420 buffer so WebRTC has valid frame storage without doing a
+      // per-frame BGRA readback/conversion or touching the placeholder pixels.
+      if (!gpu_placeholder_buffer_ || gpu_placeholder_width_ != width ||
+          gpu_placeholder_height_ != height) {
+        gpu_placeholder_buffer_ = webrtc::I420Buffer::Create(width, height);
+        gpu_placeholder_width_ = width;
+        gpu_placeholder_height_ = height;
+        std::memset(gpu_placeholder_buffer_->MutableDataY(), 16,
+                    static_cast<size_t>(gpu_placeholder_buffer_->StrideY()) * height);
+        std::memset(gpu_placeholder_buffer_->MutableDataU(), 128,
+                    static_cast<size_t>(gpu_placeholder_buffer_->StrideU()) * ((height + 1) / 2));
+        std::memset(gpu_placeholder_buffer_->MutableDataV(), 128,
+                    static_cast<size_t>(gpu_placeholder_buffer_->StrideV()) * ((height + 1) / 2));
+      }
+      buffer = gpu_placeholder_buffer_;
+      static std::atomic<bool> logged_gpu_placeholder{false};
+      if (!logged_gpu_placeholder.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[LazyPC-VIDEO] GPU-only frame path: skipping BGRA->I420 CPU conversion\n");
+        std::fflush(stderr);
+      }
+    } else {
+      buffer = webrtc::I420Buffer::Create(width, height);
+      const int convert_result = libyuv::ConvertToI420(
+          frame->data(), static_cast<size_t>(frame->stride()) * height,
+          buffer->MutableDataY(), buffer->StrideY(),
+          buffer->MutableDataU(), buffer->StrideU(),
+          buffer->MutableDataV(), buffer->StrideV(),
+          0, 0, width, height, width, height, libyuv::kRotate0,
+          static_cast<uint32_t>(frame->pixel_format()));
+      if (convert_result != 0) {
+        PushEvent("video_error", "bgra_to_i420_failed:" +
+                                     std::to_string(convert_result));
+        return;
+      }
     }
 
     webrtc::VideoFrame video_frame =
@@ -321,6 +355,9 @@ class LazyDesktopVideoSource : public webrtc::VideoTrackSource,
   std::atomic<bool> running_{false};
   std::thread capture_thread_;
   LazyFrameBroadcaster broadcaster_;
+  webrtc::scoped_refptr<webrtc::I420Buffer> gpu_placeholder_buffer_;
+  int gpu_placeholder_width_ = 0;
+  int gpu_placeholder_height_ = 0;
 };
 
 struct Event {
