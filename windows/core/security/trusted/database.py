@@ -95,6 +95,17 @@ class LazyPCDatabase:
                 row,
             )
 
+    def rename(self, device_id: str, display_name: str) -> bool:
+        """Persist a user-defined display name for a trusted phone."""
+        name = display_name.strip()
+        if not name:
+            raise ValueError("Device name cannot be empty.")
+        with self._tx() as c:
+            return c.execute(
+                f"UPDATE {self.TABLE} SET display_name = ? WHERE device_id = ?",
+                (name, device_id),
+            ).rowcount > 0
+
     def remove(self, device_id: str) -> bool:
         with self._tx() as c:
             return c.execute(

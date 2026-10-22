@@ -282,6 +282,46 @@ namespace LazyPC.UI
                         continue;
                     }
 
+                    if (type == "trusted_device_action_result")
+                    {
+                        string rawActionResult = message.RootElement.GetRawText();
+                        DispatcherQueue.TryEnqueue(() =>
+                        {
+                            try
+                            {
+                                using JsonDocument resultDocument = JsonDocument.Parse(rawActionResult);
+                                JsonElement result = resultDocument.RootElement;
+                                bool success = result.TryGetProperty("success", out var successProperty) &&
+                                               successProperty.ValueKind == JsonValueKind.True;
+                                string action = GetJsonString(result, "action");
+                                string error = GetJsonString(result, "error");
+
+                                if (success)
+                                {
+                                    Log($"[IPC] Trusted device action succeeded: {action}");
+                                    _ = _ipcClient.SendAsync(
+                                        new { type = "get_trusted_devices" },
+                                        _ipcCancellation.Token);
+                                }
+                                else
+                                {
+                                    Log($"[IPC] Trusted device action failed: {error}");
+                                    _ = ShowErrorAsync(string.IsNullOrWhiteSpace(error)
+                                        ? "Не удалось изменить доверенное устройство."
+                                        : $"Не удалось выполнить действие: {error}");
+                                    _ = _ipcClient.SendAsync(
+                                        new { type = "get_trusted_devices" },
+                                        _ipcCancellation.Token);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"[IPC] trusted_device_action_result dispatch failed: {ex}");
+                            }
+                        });
+                        continue;
+                    }
+
                     if (type == "connection_request")
                     {
                         System.Diagnostics.Debug.WriteLine(
@@ -1955,6 +1995,8 @@ namespace LazyPC.UI
             {
                 count++;
 
+                string deviceId = GetJsonString(device, "device_id");
+
                 string manufacturer = GetJsonString(
                     device,
                     "manufacturer"
@@ -2050,6 +2092,14 @@ namespace LazyPC.UI
                     }
                 );
 
+                // Fourth column: contextual actions (three-dot menu).
+                grid.ColumnDefinitions.Add(
+                    new ColumnDefinition
+                    {
+                        Width = GridLength.Auto
+                    }
+                );
+
                 var iconBorder = new Border
                 {
                     Width = 46,
@@ -2082,17 +2132,16 @@ namespace LazyPC.UI
                     Spacing = 2
                 };
 
-                textPanel.Children.Add(
-                    new TextBlock
-                    {
-                        Text = deviceName,
-                        FontSize = 15,
-                        FontWeight =
-                            Microsoft.UI.Text.FontWeights.SemiBold,
-                        Foreground =
-                            (Brush)((FrameworkElement)Content).Resources["Text"]
-                    }
-                );
+                var deviceNameText = new TextBlock
+                {
+                    Text = deviceName,
+                    FontSize = 15,
+                    FontWeight =
+                        Microsoft.UI.Text.FontWeights.SemiBold,
+                    Foreground =
+                        (Brush)((FrameworkElement)Content).Resources["Text"]
+                };
+                textPanel.Children.Add(deviceNameText);
 
                 textPanel.Children.Add(
                     new TextBlock
@@ -2128,6 +2177,102 @@ namespace LazyPC.UI
                 Grid.SetColumn(trustedBadge, 2);
                 grid.Children.Add(trustedBadge);
 
+                // Context menu for a trusted device. These handlers currently
+                // implement the UI interaction; persistence will be connected
+                // to Agent IPC in the next step.
+                var deviceActions = new MenuFlyout();
+
+                var renameItem = new MenuFlyoutItem
+                {
+                    Text = "Переименовать",
+                    Icon = new FontIcon
+                    {
+                        Glyph = "\uE70F",
+                        FontSize = 14
+                    }
+                };
+
+                var removeItem = new MenuFlyoutItem
+                {
+                    Text = "Удалить из доверенных",
+                    Icon = new FontIcon
+                    {
+                        Glyph = "\uE74D",
+                        FontSize = 14
+                    }
+                };
+                removeItem.Foreground =
+                    new SolidColorBrush(
+                        ColorHelper.FromArgb(0xFF, 0xC4, 0x2B, 0x35));
+
+                deviceActions.Items.Add(renameItem);
+                deviceActions.Items.Add(new MenuFlyoutSeparator());
+                deviceActions.Items.Add(removeItem);
+
+                renameItem.Click += async (_, _) =>
+                {
+                    string? newName = await ShowRenameTrustedDeviceDialogAsync(deviceName);
+                    if (newName is null || string.IsNullOrWhiteSpace(deviceId))
+                        return;
+
+                    try
+                    {
+                        await _ipcClient.SendAsync(
+                            new { type = "rename_trusted_device", device_id = deviceId, display_name = newName },
+                            _ipcCancellation.Token);
+                        Log($"[IPC] rename_trusted_device sent for {deviceId}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[IPC] Failed to send rename request: {ex}");
+                        await ShowErrorAsync($"Не удалось отправить запрос на переименование.\n{ex.Message}");
+                    }
+                };
+
+                removeItem.Click += async (_, _) =>
+                {
+                    bool confirmed = await ShowRemoveTrustedDeviceDialogAsync(deviceName);
+                    if (!confirmed || string.IsNullOrWhiteSpace(deviceId))
+                        return;
+
+                    try
+                    {
+                        await _ipcClient.SendAsync(
+                            new { type = "remove_trusted_device", device_id = deviceId },
+                            _ipcCancellation.Token);
+                        Log($"[IPC] remove_trusted_device sent for {deviceId}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"[IPC] Failed to send remove request: {ex}");
+                        await ShowErrorAsync($"Не удалось отправить запрос на удаление.\n{ex.Message}");
+                    }
+                };
+
+                var actionsButton = new Button
+                {
+                    Width = 36,
+                    Height = 36,
+                    Padding = new Thickness(0),
+                    Content = new FontIcon
+                    {
+                        Glyph = "\uE712",
+                        FontSize = 16,
+                        Foreground =
+                            (Brush)((FrameworkElement)Content).Resources["TextSecondary"]
+                    },
+                    Background = new SolidColorBrush(Colors.Transparent),
+                    BorderThickness = new Thickness(0),
+                    CornerRadius = new CornerRadius(10),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Flyout = deviceActions
+                };
+                ToolTipService.SetToolTip(actionsButton, "Действия устройства");
+
+                Grid.SetColumn(actionsButton, 3);
+                grid.Children.Add(actionsButton);
+
                 card.Child = grid;
                 TrustedDevicesPanel.Children.Add(card);
             }
@@ -2161,6 +2306,92 @@ namespace LazyPC.UI
             Log(
                 $"[UI] Trusted Devices rendered: {count}"
             );
+        }
+
+        private async Task<string?> ShowRenameTrustedDeviceDialogAsync(string currentName)
+        {
+            var nameBox = new TextBox
+            {
+                Text = currentName,
+                PlaceholderText = "Название устройства",
+                MaxLength = 64,
+                MinWidth = 320
+            };
+
+            var validationText = new TextBlock
+            {
+                Text = string.Empty,
+                FontSize = 12,
+                Foreground = new SolidColorBrush(ColorHelper.FromArgb(0xFF, 0xC4, 0x2B, 0x35)),
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap
+            };
+
+            var content = new StackPanel { Spacing = 8 };
+            content.Children.Add(new TextBlock
+            {
+                Text = "Укажите новое имя для этого доверенного устройства.",
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap
+            });
+            content.Children.Add(nameBox);
+            content.Children.Add(validationText);
+
+            var dialog = new ContentDialog
+            {
+                Title = "Переименовать устройство",
+                Content = content,
+                PrimaryButtonText = "Сохранить",
+                CloseButtonText = "Отмена",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = Content?.XamlRoot
+            };
+
+            if (dialog.XamlRoot is null)
+            {
+                await ShowErrorAsync("Не удалось открыть окно переименования.");
+                return null;
+            }
+
+            string? result = null;
+            dialog.PrimaryButtonClick += (_, args) =>
+            {
+                string candidate = nameBox.Text.Trim();
+                if (string.IsNullOrWhiteSpace(candidate))
+                {
+                    validationText.Text = "Введите название устройства.";
+                    args.Cancel = true;
+                    return;
+                }
+
+                result = candidate;
+            };
+
+            await dialog.ShowAsync();
+            return result;
+        }
+
+        private async Task<bool> ShowRemoveTrustedDeviceDialogAsync(string deviceName)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = "Удалить доверенное устройство?",
+                Content = new TextBlock
+                {
+                    Text = $"Устройство «{deviceName}» будет удалено из списка доверенных. Продолжить?",
+                    TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap
+                },
+                PrimaryButtonText = "Удалить",
+                CloseButtonText = "Отмена",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = Content?.XamlRoot
+            };
+
+            if (dialog.XamlRoot is null)
+            {
+                await ShowErrorAsync("Не удалось открыть подтверждение удаления.");
+                return false;
+            }
+
+            return await dialog.ShowAsync() == ContentDialogResult.Primary;
         }
 
         private static string GetJsonString(

@@ -46,6 +46,9 @@ class TrustedDeviceStore:
     def list_devices(self) -> list[dict]:
         return self.database.list_phones()
 
+    def rename(self, device_id: str, display_name: str) -> bool:
+        return self.database.rename(device_id, display_name)
+
     def remove(self, device_id: str) -> bool:
         return self.database.remove(device_id)
 

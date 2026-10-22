@@ -1127,6 +1127,43 @@ class Agent:
                 "pc_code": self.signaling.public_pc_code,
             }
 
+        if message_type in ("remove_trusted_device", "rename_trusted_device"):
+            device_id = str(message.get("device_id") or "").strip()
+            action = "remove" if message_type == "remove_trusted_device" else "rename"
+            try:
+                if not device_id:
+                    raise ValueError("Missing device_id.")
+
+                if action == "remove":
+                    success = self.trusted_devices.remove(device_id)
+                    if not success:
+                        raise LookupError("Trusted device was not found.")
+                    print(f"[IPC] Trusted Device removed: {device_id}")
+                else:
+                    display_name = str(message.get("display_name") or "").strip()
+                    if not display_name:
+                        raise ValueError("Device name cannot be empty.")
+                    success = self.trusted_devices.rename(device_id, display_name)
+                    if not success:
+                        raise LookupError("Trusted device was not found.")
+                    print(f"[IPC] Trusted Device renamed: {device_id}")
+
+                return {
+                    "type": "trusted_device_action_result",
+                    "action": action,
+                    "device_id": device_id,
+                    "success": True,
+                }
+            except Exception as error:
+                print(f"[IPC] Trusted Device {action} failed: {error}")
+                return {
+                    "type": "trusted_device_action_result",
+                    "action": action,
+                    "device_id": device_id,
+                    "success": False,
+                    "error": str(error),
+                }
+
         if message_type == "get_trusted_devices":
             print("[IPC] UI requested Trusted Devices")
 
