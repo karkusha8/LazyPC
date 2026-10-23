@@ -1463,6 +1463,11 @@ class WebRTCForegroundService : Service() {
         return webrtc
     }
 
+    /** True only after the Secure Link v4 auth_complete message is verified. */
+    fun isSecureSessionAuthorized(): Boolean {
+        return secureSessionAuthorized && sessionConnected
+    }
+
     fun isConnectionHealthy():
             Boolean {
         return webrtc.isConnectionHealthy()

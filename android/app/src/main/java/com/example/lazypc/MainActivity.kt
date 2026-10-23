@@ -15,6 +15,8 @@ import android.util.Log
 import android.os.Handler
 import android.os.Looper
 import android.content.Intent
+import android.content.ClipboardManager
+import android.content.ClipData
 import androidx.activity.compose.setContent
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AlertDialog
@@ -62,6 +64,14 @@ class MainActivity : AppCompatActivity() {
     private var pendingSecureLinkCodeAccepted: (() -> Unit)? = null
     private var webRtcService: WebRTCForegroundService? = null
     private var serviceBound = false
+    private var activityResumed = false
+    private var clipboardManager: ClipboardManager? = null
+    private var lastClipboardText: String? = null
+    private var lastRemoteClipboardText: String? = null
+
+    private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+        sendAndroidClipboardIfAuthorized()
+    }
 
     private lateinit var trustedPcStore: TrustedPcStore
     private var trustedPcs by mutableStateOf<List<TrustedPc>>(emptyList())
@@ -181,6 +191,9 @@ class MainActivity : AppCompatActivity() {
 
             Log.d(TAG_APP, "🟢 WEBRTC SERVICE BOUND")
             initializeFromService()
+            if (activityResumed) {
+                startClipboardSyncForForeground()
+            }
 
             lifecycleHandler.removeCallbacks(pcStatusPoll)
             lifecycleHandler.post(pcStatusPoll)
@@ -876,16 +889,103 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun sendAndroidClipboardIfAuthorized() {
+        val service = webRtcService ?: return
+        if (!service.isSecureSessionAuthorized()) return
+        val manager = clipboardManager ?: return
+        val clip = manager.primaryClip ?: return
+        if (clip.itemCount <= 0) return
+        val item = clip.getItemAt(0)
+        val rawText = item.coerceToText(this)?.toString() ?: return
+
+        // Android/system clipboard providers can include one trailing line break
+        // for plain text copied without one. Remove only a single terminal CR/LF,
+        // preserving intentional internal newlines and spaces.
+        val text = if (rawText.endsWith("\r\n")) {
+            rawText.dropLast(2)
+        } else if (rawText.endsWith("\n") || rawText.endsWith("\r")) {
+            rawText.dropLast(1)
+        } else {
+            rawText
+        }
+
+        if (text.length > 1_000_000 || text == lastClipboardText) return
+        val payload = org.json.JSONObject()
+            .put("type", "clipboard_text")
+            .put("text", text)
+            .toString()
+        if (service.webRtcClient().sendText(payload)) {
+            lastClipboardText = text
+            Log.d(TAG_APP, "[CLIPBOARD] Android -> Windows text sent")
+        }
+    }
+
+    private fun handleRemoteClipboardMessage(raw: String) {
+        val service = webRtcService ?: return
+        if (!service.isSecureSessionAuthorized()) return
+        try {
+            val message = org.json.JSONObject(raw)
+            if (message.optString("type") != "clipboard_text") return
+            val text = message.optString("text", "")
+            if (text.length > 1_000_000 || text == lastClipboardText) return
+            val manager = clipboardManager ?: return
+            lastRemoteClipboardText = text
+            lastClipboardText = text
+            manager.setPrimaryClip(ClipData.newPlainText("LazyPC", text))
+            Log.d(TAG_APP, "[CLIPBOARD] Windows -> Android text received")
+        } catch (error: Exception) {
+            Log.w(TAG_APP, "Invalid clipboard sync message", error)
+        }
+    }
+
+    private fun startClipboardSyncForForeground() {
+        clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
+        clipboardManager = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboardManager?.addPrimaryClipChangedListener(clipboardListener)
+        val service = webRtcService ?: return
+        service.webRtcClient().onControlText = { raw ->
+            runOnUiThread { handleRemoteClipboardMessage(raw) }
+        }
+        // Clipboard access can still be denied during the Activity resume transition.
+        // Retry on the next UI-loop turn, once Android has made the Activity focused.
+        window.decorView.post {
+            if (activityResumed && hasWindowFocus()) {
+                sendAndroidClipboardIfAuthorized()
+            }
+        }
+    }
+
+    private fun stopClipboardSyncForForeground() {
+        clipboardManager?.removePrimaryClipChangedListener(clipboardListener)
+        clipboardManager = null
+        webRtcService?.webRtcClient()?.onControlText = null
+    }
+
     override fun onPause() {
+        activityResumed = false
         super.onPause()
         Log.d(TAG_APP, "⏸ APP PAUSED")
+        stopClipboardSyncForForeground()
         // Do not close WebRTC or force a signaling reconnect here.
         // If the OS/network keeps the transport alive, onResume will reuse it.
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && activityResumed) {
+            window.decorView.post {
+                if (activityResumed && hasWindowFocus()) {
+                    sendAndroidClipboardIfAuthorized()
+                }
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         Log.d(TAG_APP, "▶ APP RESUMED")
+        startClipboardSyncForForeground()
 
         if (!sessionConnected && !simpleConnectionConnected) {
             lifecycleHandler.removeCallbacks(pcStatusPoll)
@@ -901,6 +1001,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         finishing = true
+        stopClipboardSyncForForeground()
         lifecycleHandler.removeCallbacksAndMessages(null)
 
         if (serviceBound) {
@@ -923,4 +1024,4 @@ class MainActivity : AppCompatActivity() {
 
         super.onDestroy()
     }
-}
+}830

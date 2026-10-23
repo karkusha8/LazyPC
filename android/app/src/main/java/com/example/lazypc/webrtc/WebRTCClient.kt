@@ -65,6 +65,7 @@ class WebRTCClient(
             DataChannel? = null
     private var secureAuthChannel: DataChannel? = null
     @Volatile var onSecureAuthText: ((String) -> Unit)? = null
+    @Volatile var onControlText: ((String) -> Unit)? = null
 
     private var statsExecutor: ScheduledExecutorService? = null
 
@@ -414,12 +415,16 @@ class WebRTCClient(
                                     }
 
                                     if (text == "PONG") {
-
                                         Log.d(
                                             "DATA",
                                             "✅ PONG RECEIVED"
                                         )
+                                        return
                                     }
+
+                                    // Normal control-channel events (e.g. clipboard sync).
+                                    // The service/activity enforces the session authorization gate.
+                                    onControlText?.invoke(text)
                                 }
                             }
                         )

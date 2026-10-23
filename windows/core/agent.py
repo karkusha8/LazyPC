@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import hmac
 import json
 import os
@@ -26,6 +27,92 @@ from webrtc.peer_session import PeerConnection
 
 from ipc.server import WebSocketServer
 from security.trusted.pairing import TrustedDeviceStore
+
+
+def _read_windows_clipboard_text() -> str | None:
+    """Read CF_UNICODETEXT from the Windows clipboard; return None if unavailable."""
+    if os.name != "nt":
+        return None
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.c_bool
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    CF_UNICODETEXT = 13
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return None
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return None
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    except Exception:
+        return None
+    finally:
+        user32.CloseClipboard()
+
+
+def _write_windows_clipboard_text(value: str) -> bool:
+    """Write text as CF_UNICODETEXT. Returns False if Windows clipboard is busy."""
+    if os.name != "nt":
+        return False
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = ctypes.c_bool
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.c_bool
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    encoded = (value + "\0").encode("utf-16-le")
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+    if not handle:
+        return False
+    pointer = kernel32.GlobalLock(handle)
+    if not pointer:
+        kernel32.GlobalFree(handle)
+        return False
+    try:
+        ctypes.memmove(pointer, encoded, len(encoded))
+    finally:
+        kernel32.GlobalUnlock(handle)
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        return False
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            kernel32.GlobalFree(handle)
+            return False
+        # Ownership of handle transfers to the system after SetClipboardData.
+        return True
+    finally:
+        user32.CloseClipboard()
 
 
 class Agent:
@@ -218,6 +305,9 @@ class Agent:
         # One cleanup task per disconnect. Native DataChannel and
         # PeerConnection events can report the same disconnect independently.
         self._session_cleanup_task: asyncio.Task | None = None
+        self._clipboard_sync_task: asyncio.Task | None = None
+        self._last_clipboard_text: str | None = None
+        self._last_remote_clipboard_text: str | None = None
 
         # ============================================================
         # IPC
@@ -940,6 +1030,9 @@ class Agent:
     # ================================================================
 
     async def _on_peer_channel_open(self):
+        if self._clipboard_sync_task is None or self._clipboard_sync_task.done():
+            self._clipboard_sync_task = asyncio.create_task(self._clipboard_sync_loop())
+
         # Pairing and ordinary V2 sessions retain their existing flows.
         if (
             self.connection_mode != "trusted"
@@ -1012,21 +1105,58 @@ class Agent:
         self._clear_connection_state()
         print("[SECURITY] Trusted session closed: Stage 3 proof is mandatory")
 
+    async def _clipboard_sync_loop(self):
+        """Poll Windows clipboard only while the authorized control channel is active."""
+        try:
+            while not self._stopping:
+                if getattr(self.peer, "security_authorized", False):
+                    current = await asyncio.to_thread(_read_windows_clipboard_text)
+                    if current is not None and current != self._last_clipboard_text:
+                        self._last_clipboard_text = current
+                        if current != self._last_remote_clipboard_text:
+                            payload = json.dumps(
+                                {"type": "clipboard_text", "text": current},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            if self.peer.send_text(payload):
+                                print("[CLIPBOARD] Windows -> Android text sent")
+                await asyncio.sleep(0.6)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print("[CLIPBOARD] Windows clipboard sync stopped:", error)
+
     # ================================================================
     # DATACHANNEL TEXT
     # ================================================================
 
     async def _handle_peer_text(self, text: str):
-
-        if not self.pairing_mode:
-            return
-
         try:
             message = json.loads(text)
         except Exception:
             return
 
         message_type = message.get("type")
+
+        # Clipboard packets arrive on the normal control channel, whose
+        # PeerConnection dispatcher already drops all traffic before authorization.
+        if message_type == "clipboard_text":
+            if not getattr(self.peer, "security_authorized", False):
+                return
+            value = message.get("text")
+            if not isinstance(value, str) or len(value) > 1_000_000:
+                return
+            if value == self._last_clipboard_text:
+                return
+            if await asyncio.to_thread(_write_windows_clipboard_text, value):
+                self._last_remote_clipboard_text = value
+                self._last_clipboard_text = value
+                print("[CLIPBOARD] Android -> Windows text received")
+            return
+
+        if not self.pairing_mode:
+            return
 
         if message_type == "pair_hello":
             try:
@@ -1689,3 +1819,5 @@ class Agent:
     async def _on_peer_closed(self):
         print("[AGENT] Peer disconnected")
         self._schedule_session_cleanup("peer disconnected")
+
+
